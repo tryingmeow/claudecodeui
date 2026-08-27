@@ -97,11 +97,25 @@ export class CursorSessionSynchronizer implements IProviderSessionSynchronizer {
   }
 
   /**
-   * Extracts project path from Cursor worker.log.
+   * Extracts project path from Cursor's per-project `.workspace-trusted` marker
+   * (current cursor-agent versions), falling back to grepping `worker.log` for a
+   * `workspacePath=` line (older versions that predate the marker file and never
+   * wrote it). Both live next to each other in the project's root directory.
    */
-  private async extractProjectPathFromWorkerLog(filePath: string): Promise<string | null> {
+  private async extractProjectPathFromWorkerLog(workerLogPath: string): Promise<string | null> {
+    const trustMarkerPath = path.join(path.dirname(workerLogPath), '.workspace-trusted');
     try {
-      const fileStream = fs.createReadStream(filePath, { encoding: 'utf8' });
+      const trustMarkerRaw = await fsp.readFile(trustMarkerPath, 'utf8');
+      const trustMarker = JSON.parse(trustMarkerRaw) as { workspacePath?: unknown };
+      if (typeof trustMarker.workspacePath === 'string' && trustMarker.workspacePath.trim()) {
+        return trustMarker.workspacePath.trim();
+      }
+    } catch {
+      // Older cursor-agent versions never wrote this marker; fall through to worker.log.
+    }
+
+    try {
+      const fileStream = fs.createReadStream(workerLogPath, { encoding: 'utf8' });
       const lineReader = readline.createInterface({ input: fileStream, crlfDelay: Infinity });
 
       for await (const line of lineReader) {
