@@ -2,6 +2,8 @@ import { access, readdir } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 
+import spawn from 'cross-spawn';
+
 import type { IProviderModels } from '@/shared/interfaces.js';
 import type {
   ProviderCurrentActiveModel,
@@ -43,6 +45,86 @@ export const CURSOR_PREDEFINED_MODELS: ProviderModelsDefinition = {
 
 const CURSOR_CHATS_ROOT = path.join(os.homedir(), '.cursor', 'chats');
 
+/** `cursor-agent models` prints one `<id> - <label>` pair per line, e.g. `grok-4.6 - Grok 4.6`. */
+const CURSOR_MODELS_LINE_PATTERN = /^([a-zA-Z0-9_.:-]+)\s+-\s+(.+)$/;
+const CURSOR_LIVE_MODELS_TIMEOUT_MS = 8000;
+const CURSOR_LIVE_MODELS_CACHE_TTL_MS = 5 * 60 * 1000;
+
+let cursorLiveModelsCache: { options: ProviderModelsDefinition['OPTIONS']; fetchedAt: number } | null = null;
+
+const parseCursorModelsOutput = (stdout: string): ProviderModelsDefinition['OPTIONS'] => {
+  const options: ProviderModelsDefinition['OPTIONS'] = [];
+  for (const rawLine of stdout.split(/\r?\n/)) {
+    const match = CURSOR_MODELS_LINE_PATTERN.exec(rawLine.trim());
+    if (!match) {
+      continue;
+    }
+    const [, value, label] = match;
+    options.push({ value, label: label.trim() });
+  }
+  return options;
+};
+
+/** Runs `cursor-agent models` and parses its output; resolves null on any failure so callers fall back to the curated list. */
+const fetchCursorModelsLive = (): Promise<ProviderModelsDefinition['OPTIONS'] | null> =>
+  new Promise((resolve) => {
+    let settled = false;
+    const finish = (result: ProviderModelsDefinition['OPTIONS'] | null) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      resolve(result);
+    };
+
+    let child: ReturnType<typeof spawn>;
+    try {
+      child = spawn('cursor-agent', ['models'], { stdio: ['ignore', 'pipe', 'ignore'] });
+    } catch {
+      finish(null);
+      return;
+    }
+
+    const timeout = setTimeout(() => {
+      child.kill();
+      finish(null);
+    }, CURSOR_LIVE_MODELS_TIMEOUT_MS);
+
+    let stdout = '';
+    child.stdout?.on('data', (chunk: Buffer) => {
+      stdout += chunk.toString('utf8');
+    });
+    child.on('error', () => {
+      clearTimeout(timeout);
+      finish(null);
+    });
+    child.on('close', (code) => {
+      clearTimeout(timeout);
+      if (code !== 0) {
+        finish(null);
+        return;
+      }
+      const options = parseCursorModelsOutput(stdout);
+      finish(options.length > 0 ? options : null);
+    });
+  });
+
+/** Live catalog with a short cache, falling back to {@link CURSOR_PREDEFINED_MODELS} when the CLI call fails or is stale-cold. */
+const resolveCursorModels = async (): Promise<ProviderModelsDefinition> => {
+  const now = Date.now();
+  if (cursorLiveModelsCache && now - cursorLiveModelsCache.fetchedAt < CURSOR_LIVE_MODELS_CACHE_TTL_MS) {
+    return { OPTIONS: cursorLiveModelsCache.options, DEFAULT: CURSOR_PREDEFINED_MODELS.DEFAULT };
+  }
+
+  const liveOptions = await fetchCursorModelsLive();
+  if (liveOptions) {
+    cursorLiveModelsCache = { options: liveOptions, fetchedAt: now };
+    return { OPTIONS: liveOptions, DEFAULT: CURSOR_PREDEFINED_MODELS.DEFAULT };
+  }
+
+  return CURSOR_PREDEFINED_MODELS;
+};
+
 const resolveCursorSessionStorePath = async (sessionId: string): Promise<string | null> => {
   const safeSessionId = sanitizeLeafDirectoryName(sessionId, 'cursor session id');
 
@@ -71,18 +153,20 @@ const resolveCursorSessionStorePath = async (sessionId: string): Promise<string 
 /** Provider registry model adapter for Cursor predefined models and session metadata. */
 export class CursorProviderModels implements IProviderModels {
   async getSupportedModels(): Promise<ProviderModelsDefinition> {
-    return CURSOR_PREDEFINED_MODELS;
+    return resolveCursorModels();
   }
 
   async getCurrentActiveModel(sessionId?: string): Promise<ProviderCurrentActiveModel> {
+    const supportedModels = await this.getSupportedModels();
+
     if (!sessionId?.trim()) {
-      return buildDefaultProviderCurrentActiveModel(CURSOR_PREDEFINED_MODELS);
+      return buildDefaultProviderCurrentActiveModel(supportedModels);
     }
 
     try {
       const storeDbPath = await resolveCursorSessionStorePath(sessionId);
       if (!storeDbPath) {
-        return buildDefaultProviderCurrentActiveModel(CURSOR_PREDEFINED_MODELS);
+        return buildDefaultProviderCurrentActiveModel(supportedModels);
       }
 
       const { default: Database } = await import('better-sqlite3');
@@ -114,6 +198,6 @@ export class CursorProviderModels implements IProviderModels {
       // Fall through to the curated default when Cursor metadata cannot be read.
     }
 
-    return buildDefaultProviderCurrentActiveModel(CURSOR_PREDEFINED_MODELS);
+    return buildDefaultProviderCurrentActiveModel(supportedModels);
   }
 }

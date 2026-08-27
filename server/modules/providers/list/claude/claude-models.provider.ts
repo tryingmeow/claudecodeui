@@ -1,7 +1,10 @@
 import { readFile } from 'node:fs/promises';
 
+import { query, type ModelInfo } from '@anthropic-ai/claude-agent-sdk';
+
 import { sessionsDb } from '@/modules/database/index.js';
 import type { IProviderModels } from '@/shared/interfaces.js';
+import { resolveClaudeCodeExecutablePath } from '@/shared/claude-cli-path.js';
 import type {
   ProviderCurrentActiveModel,
   ProviderModelOption,
@@ -276,20 +279,85 @@ const readClaudeSessionModelFromJsonl = async (
   return null;
 };
 
+const CLAUDE_LIVE_MODELS_CACHE_TTL_MS = 5 * 60 * 1000;
+const CLAUDE_LIVE_MODELS_TIMEOUT_MS = 10000;
+
+let claudeLiveModelsCache: { options: ProviderModelOption[]; fetchedAt: number } | null = null;
+
+/**
+ * Maps one SDK catalog entry onto the picker shape. The SDK reports only the effort levels
+ * it understands, so `ultracode` (xhigh plus standing workflow orchestration) is appended
+ * to every model that reports `xhigh`, matching the predefined catalog.
+ */
+export const toClaudeModelOption = (model: ModelInfo): ProviderModelOption => {
+  const effortLevels = model.supportsEffort ? model.supportedEffortLevels ?? [] : [];
+  if (effortLevels.length === 0) {
+    return { value: model.value, label: model.displayName, description: model.description };
+  }
+
+  const values: { value: string; description?: string }[] = effortLevels.map((value) => ({ value }));
+  if (effortLevels.includes('xhigh')) {
+    values.push(ULTRACODE_EFFORT_OPTION);
+  }
+
+  return {
+    value: model.value,
+    label: model.displayName,
+    description: model.description,
+    effort: {
+      ...(effortLevels.includes('high') ? { default: 'high' } : {}),
+      values,
+    },
+  };
+};
+
+/**
+ * Queries the Claude Agent SDK for the live model catalog. `persistSession: false` keeps this
+ * throwaway request out of `~/.claude/projects/` so it never shows up as a stray session in the UI —
+ * that side effect (not the live data itself) is why this call used to be disabled.
+ */
+const fetchClaudeModelsLive = async (): Promise<ProviderModelOption[] | null> => {
+  const queryInstance = query({
+    prompt: 'Get supported models',
+    options: {
+      persistSession: false,
+      pathToClaudeCodeExecutable: resolveClaudeCodeExecutablePath(process.env.CLAUDE_CLI_PATH),
+    },
+  });
+
+  const timeout = setTimeout(() => {
+    queryInstance.close();
+  }, CLAUDE_LIVE_MODELS_TIMEOUT_MS);
+
+  try {
+    const supportedModels = await queryInstance.supportedModels();
+    return supportedModels.length > 0 ? supportedModels.map(toClaudeModelOption) : null;
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timeout);
+    queryInstance.close();
+  }
+};
+
+const resolveClaudeModels = async (): Promise<ProviderModelsDefinition> => {
+  const now = Date.now();
+  if (claudeLiveModelsCache && now - claudeLiveModelsCache.fetchedAt < CLAUDE_LIVE_MODELS_CACHE_TTL_MS) {
+    return { OPTIONS: claudeLiveModelsCache.options, DEFAULT: CLAUDE_PREDEFINED_MODELS.DEFAULT };
+  }
+
+  const liveOptions = await fetchClaudeModelsLive();
+  if (liveOptions) {
+    claudeLiveModelsCache = { options: liveOptions, fetchedAt: now };
+    return { OPTIONS: liveOptions, DEFAULT: CLAUDE_PREDEFINED_MODELS.DEFAULT };
+  }
+
+  return CLAUDE_PREDEFINED_MODELS;
+};
+
 export class ClaudeProviderModels implements IProviderModels {
   async getSupportedModels(): Promise<ProviderModelsDefinition> {
-    // claude creates a new jsonl file as a separate session for this request.
-    // As a result, it lists the workspace where this is invoked when it shouldn't.
-    //
-    // Disabled for now:
-    // const queryInstance = query({
-    //   prompt: 'Get supported models',
-    //   options: buildClaudeQueryOptions(),
-    // });
-    // const supportedModels = await queryInstance.supportedModels();
-    // queryInstance.close();
-    // return buildClaudeModelsDefinition(supportedModels);
-    return CLAUDE_PREDEFINED_MODELS;
+    return resolveClaudeModels();
   }
 
   async getCurrentActiveModel(sessionId?: string): Promise<ProviderCurrentActiveModel> {

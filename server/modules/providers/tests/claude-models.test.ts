@@ -1,7 +1,10 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { extractClaudeEventModel } from '@/modules/providers/list/claude/claude-models.provider.js';
+import {
+  extractClaudeEventModel,
+  toClaudeModelOption,
+} from '@/modules/providers/list/claude/claude-models.provider.js';
 
 const SESSION_ID = 'session-1';
 
@@ -84,4 +87,34 @@ test('falls back to the message model when every content hit is a placeholder', 
     ),
     'claude-sonnet-5',
   );
+});
+
+test('live catalog entries offer ultracode only on xhigh-capable models', () => {
+  const opus = toClaudeModelOption({
+    value: 'opus',
+    displayName: 'Opus',
+    description: 'Opus',
+    supportsEffort: true,
+    supportedEffortLevels: ['low', 'medium', 'high', 'xhigh', 'max'],
+  });
+  assert.deepEqual(
+    opus.effort?.values.map((effort) => effort.value),
+    ['low', 'medium', 'high', 'xhigh', 'max', 'ultracode'],
+  );
+  assert.equal(opus.effort?.default, 'high');
+
+  const sonnet = toClaudeModelOption({
+    value: 'default',
+    displayName: 'Default',
+    description: 'Default',
+    supportsEffort: true,
+    supportedEffortLevels: ['low', 'medium', 'high', 'max'],
+  });
+  assert.deepEqual(
+    sonnet.effort?.values.map((effort) => effort.value),
+    ['low', 'medium', 'high', 'max'],
+  );
+
+  const haiku = toClaudeModelOption({ value: 'haiku', displayName: 'Haiku', description: 'Haiku' });
+  assert.equal(haiku.effort, undefined);
 });
