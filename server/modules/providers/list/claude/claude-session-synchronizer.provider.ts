@@ -140,21 +140,34 @@ export class ClaudeSessionSynchronizer implements IProviderSessionSynchronizer {
     const existingSession = sessionsDb.getSessionByProviderSessionId(parsed.sessionId)
       ?? sessionsDb.getSessionById(parsed.sessionId);
     const existingSessionName = existingSession?.custom_name;
-    if (existingSessionName && existingSessionName !== 'Untitled Claude Session') {
+
+    // Claude names a session itself once the conversation has enough content,
+    // so its `ai-title` is the best available name. The first typed line from
+    // history.jsonl only stands in until that title exists — on its own it
+    // yields titles like "/model", which is what the user typed first, not
+    // what the session is about.
+    const historySessionName = nameMap.get(parsed.sessionId);
+    const aiSessionName = await this.extractSessionTitle(filePath, parsed.sessionId);
+
+    // A stored name is kept only when the user chose it. Names this
+    // synchronizer derived earlier are replaced as soon as a better one
+    // appears, which is how a session titled from its first typed line picks
+    // up Claude's own title on a later sync.
+    const derivedNames = new Set(
+      [historySessionName, aiSessionName, 'Untitled Claude Session']
+        .filter((name): name is string => Boolean(name))
+        .map((name) => normalizeSessionName(name, 'Untitled Claude Session'))
+    );
+    if (existingSessionName && !derivedNames.has(normalizeSessionName(existingSessionName, 'Untitled Claude Session'))) {
       return {
         ...parsed,
         sessionName: normalizeSessionName(existingSessionName, 'Untitled Claude Session'),
       };
     }
 
-    let sessionName = await this.extractSessionTitle(filePath, parsed.sessionId);
-    if (!sessionName) {
-      sessionName = nameMap.get(parsed.sessionId);
-    }
-
     return {
       ...parsed,
-      sessionName: normalizeSessionName(sessionName, 'Untitled Claude Session'),
+      sessionName: normalizeSessionName(aiSessionName ?? historySessionName, 'Untitled Claude Session'),
     };
   }
 

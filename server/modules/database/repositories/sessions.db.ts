@@ -28,6 +28,28 @@ type RecentSessionsPage = {
 const SESSION_ROW_COLUMNS =
   'session_id, provider, provider_session_id, project_path, jsonl_path, custom_name, model, effort, forked_from_session_id, isArchived, created_at, updated_at';
 
+/**
+ * Builds the optional `provider IN (...)` predicate for session filters.
+ *
+ * The placeholder list is generated from the validated id array so provider ids
+ * are always bound as parameters and never interpolated into SQL text. An empty
+ * or omitted filter yields an empty clause, which keeps every unfiltered caller
+ * on exactly the query it had before.
+ */
+function buildProviderFilterClause(
+  providers: readonly string[] | undefined,
+  column = 'provider',
+): { clause: string; params: string[] } {
+  if (!providers || providers.length === 0) {
+    return { clause: '', params: [] };
+  }
+
+  return {
+    clause: ` AND ${column} IN (${providers.map(() => '?').join(', ')})`,
+    params: [...providers],
+  };
+}
+
 const SQLITE_UTC_TIMESTAMP_REGEX = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/;
 
 function normalizeTimestamp(value?: string): string | null {
@@ -543,11 +565,12 @@ export const sessionsDb = {
    * and correctly ordered across projects instead of flattening only the
    * per-project slices already loaded by the client.
    */
-  getRecentSessionsPage(limit: number, offset: number): RecentSessionsPage {
+  getRecentSessionsPage(limit: number, offset: number, providers?: readonly string[]): RecentSessionsPage {
     const db = getConnection();
+    const providerFilter = buildProviderFilterClause(providers, 'sessions.provider');
     const visibilityClause = `
       sessions.isArchived = 0
-      AND (projects.isArchived IS NULL OR projects.isArchived = 0)
+      AND (projects.isArchived IS NULL OR projects.isArchived = 0)${providerFilter.clause}
     `;
     const rows = db
       .prepare(
@@ -559,7 +582,7 @@ export const sessionsDb = {
                   sessions.session_id DESC
          LIMIT ? OFFSET ?`
       )
-      .all(limit, offset) as SessionRow[];
+      .all(...providerFilter.params, limit, offset) as SessionRow[];
     const countRow = db
       .prepare(
         `SELECT COUNT(*) AS count
@@ -567,7 +590,7 @@ export const sessionsDb = {
          LEFT JOIN projects ON projects.project_path = sessions.project_path
          WHERE ${visibilityClause}`
       )
-      .get() as { count: number } | undefined;
+      .get(...providerFilter.params) as { count: number } | undefined;
 
     return {
       sessions: normalizeSessionRows(rows),
@@ -579,16 +602,17 @@ export const sessionsDb = {
    * Archived rows are intentionally queried separately so the caller can render
    * them in a dedicated view without reintroducing them into active session lists.
    */
-  getArchivedSessions(): SessionRow[] {
+  getArchivedSessions(providers?: readonly string[]): SessionRow[] {
     const db = getConnection();
+    const providerFilter = buildProviderFilterClause(providers);
     const rows = db
       .prepare(
         `SELECT ${SESSION_ROW_COLUMNS}
          FROM sessions
-         WHERE isArchived = 1
+         WHERE isArchived = 1${providerFilter.clause}
          ORDER BY datetime(COALESCE(updated_at, created_at)) DESC, session_id DESC`
       )
-      .all() as SessionRow[];
+      .all(...providerFilter.params) as SessionRow[];
 
     return normalizeSessionRows(rows);
   },
@@ -612,48 +636,56 @@ export const sessionsDb = {
    * Permanent project deletion must see every session row for the path,
    * including archived ones, so their transcript files can be cleaned up.
    */
-  getSessionsByProjectPathIncludingArchived(projectPath: string): SessionRow[] {
+  getSessionsByProjectPathIncludingArchived(projectPath: string, providers?: readonly string[]): SessionRow[] {
     const db = getConnection();
     const normalizedProjectPath = normalizeProjectPath(projectPath);
+    const providerFilter = buildProviderFilterClause(providers);
     const rows = db
       .prepare(
         `SELECT ${SESSION_ROW_COLUMNS}
          FROM sessions
-         WHERE project_path = ?`
+         WHERE project_path = ?${providerFilter.clause}`
       )
-      .all(normalizedProjectPath) as SessionRow[];
+      .all(normalizedProjectPath, ...providerFilter.params) as SessionRow[];
 
     return normalizeSessionRows(rows);
   },
 
-  getSessionsByProjectPathPage(projectPath: string, limit: number, offset: number): SessionRow[] {
+  getSessionsByProjectPathPage(
+    projectPath: string,
+    limit: number,
+    offset: number,
+    providers?: readonly string[],
+  ): SessionRow[] {
     const db = getConnection();
     const normalizedProjectPath = normalizeProjectPath(projectPath);
+    const providerFilter = buildProviderFilterClause(providers);
     const rows = db
       .prepare(
         `SELECT ${SESSION_ROW_COLUMNS}
          FROM sessions
          WHERE project_path = ?
-           AND isArchived = 0
+           AND isArchived = 0${providerFilter.clause}
          ORDER BY datetime(COALESCE(updated_at, created_at)) DESC, session_id DESC
          LIMIT ? OFFSET ?`
       )
-      .all(normalizedProjectPath, limit, offset) as SessionRow[];
+      .all(normalizedProjectPath, ...providerFilter.params, limit, offset) as SessionRow[];
 
     return normalizeSessionRows(rows);
   },
 
-  countSessionsByProjectPath(projectPath: string): number {
+  countSessionsByProjectPath(projectPath: string, providers?: readonly string[]): number {
     const db = getConnection();
     const normalizedProjectPath = normalizeProjectPath(projectPath);
+    const providerFilter = buildProviderFilterClause(providers);
     const row = db
       .prepare(
         `SELECT COUNT(*) AS count
          FROM sessions
          WHERE project_path = ?
-           AND isArchived = 0`
+           AND isArchived = 0${providerFilter.clause}`
       )
-      .get(normalizedProjectPath) as { count: number } | undefined;
+      .get(normalizedProjectPath, ...providerFilter.params) as { count: number } | undefined;
 
     return Number(row?.count ?? 0);
   },

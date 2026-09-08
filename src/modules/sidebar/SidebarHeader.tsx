@@ -1,12 +1,15 @@
 import { FolderPlus, Plus, RefreshCw, Search, X, PanelLeftClose } from 'lucide-react';
 import type { TFunction } from 'i18next';
 
-import { Button, Input } from '@/shared/ui';
+import { Button, Input, LLMProviderLogo } from '@/shared/ui';
 import { CLOUDCLI_WORDMARK_FONT_FAMILY } from '@/shared/constants';
-import { IS_PLATFORM } from '@/shared/utils';
-import type { SidebarSearchMode } from '@/shared/types';
+import { useSidebarProviderFilter } from '@/shared/hooks/useSidebarProviderFilter';
+import { SIDEBAR_FILTER_PROVIDERS } from '@/shared/sidebarProviderFilter';
+import { IS_PLATFORM, cn } from '@/shared/utils';
+import type { LLMProvider, SidebarSearchMode } from '@/shared/types';
 import GitHubStarBadge from '@/modules/sidebar/GitHubStarBadge';
 import SidebarModeTabs from '@/modules/sidebar/SidebarModeTabs';
+import { PROVIDER_LABELS } from '@/modules/sidebar/utils/sidebarProjectFormatting';
 
 const MOD_KEY =
   typeof navigator !== 'undefined' && /Mac|iPhone|iPad/.test(navigator.platform) ? '⌘' : 'Ctrl';
@@ -50,6 +53,66 @@ function LogoBlock({ t }: { t: TFunction }) {
   );
 }
 
+/**
+ * Sidebar CLI filter. Orthogonal to the mode tabs above it: it narrows
+ * whichever list the current mode shows. No selection means every CLI and
+ * renders as a neutral resting row, not as "everything switched off".
+ *
+ * Module-level so the buttons are not remounted on every header render, which
+ * would drop keyboard focus.
+ */
+function ProviderFilterRow({
+  providerFilter,
+  onToggleProvider,
+  compact = false,
+  t,
+}: {
+  providerFilter: LLMProvider[];
+  onToggleProvider: (provider: LLMProvider) => void;
+  compact?: boolean;
+  t: TFunction;
+}) {
+  const hasSelection = providerFilter.length > 0;
+
+  return (
+    <div
+      role="group"
+      aria-label={t('search.providerFilterLabel', 'Filter sessions by CLI')}
+      className="flex rounded-lg bg-muted/50 p-0.5"
+    >
+      {SIDEBAR_FILTER_PROVIDERS.map((provider) => {
+        const providerLabel = PROVIDER_LABELS[provider];
+        const isSelected = providerFilter.includes(provider);
+
+        return (
+          <button
+            key={provider}
+            type="button"
+            onClick={() => onToggleProvider(provider)}
+            aria-pressed={isSelected}
+            aria-label={t('search.providerFilterOption', {
+              defaultValue: 'Show only {{provider}} sessions',
+              provider: providerLabel,
+            })}
+            title={providerLabel}
+            className={cn(
+              'flex flex-1 items-center justify-center rounded-md transition-all',
+              compact ? 'py-2' : 'py-1.5',
+              isSelected
+                ? 'bg-background text-foreground shadow-sm ring-1 ring-primary/25'
+                : hasSelection
+                  ? 'text-muted-foreground opacity-45 grayscale hover:text-foreground hover:opacity-90 hover:grayscale-0'
+                  : 'text-muted-foreground hover:bg-background/60 hover:text-foreground',
+            )}
+          >
+            <LLMProviderLogo provider={provider} className={compact ? 'h-4 w-4' : 'h-3.5 w-3.5'} />
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
 /** Rendered by SidebarContent at the top of the panel for the search box, search-mode tabs, refresh and new-project actions. */
 export default function SidebarHeader({
   isPWA,
@@ -70,7 +133,16 @@ export default function SidebarHeader({
   onCollapseSidebar,
   t,
 }: SidebarHeaderProps) {
-  const showSearchTools = (projectsCount > 0 || runningSessionsCount > 0 || archivedSessionsCount > 0 || isArchivedSessionsLoading) && !isLoading;
+  const { providerFilter, toggleProvider } = useSidebarProviderFilter();
+  // An active CLI filter keeps the tools visible even when it matches nothing,
+  // otherwise the row that has to be used to clear it would disappear with it.
+  const showSearchTools = (
+    projectsCount > 0
+    || runningSessionsCount > 0
+    || archivedSessionsCount > 0
+    || isArchivedSessionsLoading
+    || providerFilter.length > 0
+  ) && !isLoading;
   const searchPlaceholder = searchMode === 'conversations'
     ? t('search.conversationsPlaceholder')
     : searchMode === 'archived'
@@ -175,6 +247,7 @@ export default function SidebarHeader({
                 </kbd>
               )}
             </div>
+            <ProviderFilterRow providerFilter={providerFilter} onToggleProvider={toggleProvider} t={t} />
           </div>
         )}
       </div>
@@ -245,6 +318,7 @@ export default function SidebarHeader({
                 </button>
               )}
             </div>
+            <ProviderFilterRow providerFilter={providerFilter} onToggleProvider={toggleProvider} t={t} compact />
           </div>
         )}
       </div>

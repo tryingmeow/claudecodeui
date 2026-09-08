@@ -19,7 +19,7 @@ import type {
   ProviderSkillCreateInput,
   UpsertProviderMcpServerInput,
 } from '@/shared/types.js';
-import { AppError, asyncHandler, createApiSuccessResponse } from '@/shared/utils.js';
+import { AppError, asyncHandler, createApiSuccessResponse, parseProviderFilterQuery } from '@/shared/utils.js';
 
 const router = express.Router();
 
@@ -862,15 +862,17 @@ router.get(
   asyncHandler(async (req: Request, res: Response) => {
     const limit = parseBoundedIntegerQuery(req.query.limit, 'limit', 40, 1, 100);
     const offset = parseBoundedIntegerQuery(req.query.offset, 'offset', 0, 0);
-    const page = sessionsService.listRecentSessions(limit, offset);
+    const providers = parseProviderFilterQuery(req.query.provider);
+    const page = sessionsService.listRecentSessions(limit, offset, providers);
     res.json(createApiSuccessResponse(page));
   }),
 );
 
 router.get(
   '/sessions/archived',
-  asyncHandler(async (_req: Request, res: Response) => {
-    const sessions = sessionsService.listArchivedSessions();
+  asyncHandler(async (req: Request, res: Response) => {
+    const providers = parseProviderFilterQuery(req.query.provider);
+    const sessions = sessionsService.listArchivedSessions(providers);
     res.json(createApiSuccessResponse({ sessions }));
   }),
 );

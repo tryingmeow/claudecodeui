@@ -3,11 +3,13 @@ import os from 'node:os';
 import path from 'node:path';
 
 import Database from 'better-sqlite3';
+import spawn from 'cross-spawn';
 
 import { sessionsDb } from '@/modules/database/index.js';
 import type { IProviderModels } from '@/shared/interfaces.js';
 import type {
   ProviderCurrentActiveModel,
+  ProviderModelOption,
   ProviderModelsDefinition,
 } from '@/shared/types.js';
 import {
@@ -387,6 +389,134 @@ const filterOpenCodeModelsByProvider = (
   };
 };
 
+const OPENCODE_LIVE_MODELS_TIMEOUT_MS = 10000;
+const OPENCODE_LIVE_MODELS_CACHE_TTL_MS = 5 * 60 * 1000;
+
+/** Source of the live catalog; injectable so tests do not depend on the CLI installed on the machine. */
+export type OpenCodeLiveModelsFetcher = () => Promise<ProviderModelOption[] | null>;
+
+/** `<providerID>/<modelID>` header line that precedes each verbose JSON block. */
+const OPENCODE_MODEL_HEADER_PATTERN = /^[A-Za-z0-9_.:-]+\/[^\s]+$/;
+
+/** Display names for the providers the curated list already spelled out; others show their raw id. */
+const OPENCODE_PROVIDER_LABELS: Record<string, string> = {
+  opencode: 'OpenCode Zen',
+  anthropic: 'Anthropic',
+  openai: 'OpenAI',
+};
+
+const buildOpenCodeDescription = (providerId: string, detail: Record<string, unknown> | null): string => {
+  const providerLabel = OPENCODE_PROVIDER_LABELS[providerId] ?? providerId;
+  const cost = readObjectRecord(detail?.cost);
+  const isFree = cost !== null && cost.input === 0 && cost.output === 0;
+  return isFree ? `${providerLabel} · Free` : providerLabel;
+};
+
+/**
+ * Parses `opencode models --verbose`, which prints a `<providerID>/<modelID>` line followed by a
+ * pretty-printed JSON object for that model (braces at column zero), repeated per model.
+ */
+export const parseOpenCodeModelsOutput = (stdout: string): ProviderModelOption[] => {
+  const lines = stdout.split(/\r?\n/);
+  const options: ProviderModelOption[] = [];
+
+  for (let index = 0; index < lines.length; index += 1) {
+    const header = lines[index].trim();
+    if (!OPENCODE_MODEL_HEADER_PATTERN.test(header)) {
+      continue;
+    }
+
+    let detail: Record<string, unknown> | null = null;
+    if (lines[index + 1] === '{') {
+      const blockStart = index + 1;
+      let blockEnd = -1;
+      for (let cursor = blockStart + 1; cursor < lines.length; cursor += 1) {
+        if (lines[cursor] === '}') {
+          blockEnd = cursor;
+          break;
+        }
+      }
+      if (blockEnd !== -1) {
+        try {
+          detail = readObjectRecord(JSON.parse(lines.slice(blockStart, blockEnd + 1).join('\n')));
+        } catch {
+          detail = null;
+        }
+        index = blockEnd;
+      }
+    }
+
+    if (typeof detail?.status === 'string' && detail.status === 'deprecated') {
+      continue;
+    }
+
+    const providerId = header.slice(0, header.indexOf('/'));
+    const modelId = header.slice(header.indexOf('/') + 1);
+    options.push({
+      value: header,
+      label: readOptionalString(detail?.name) ?? modelId,
+      description: buildOpenCodeDescription(providerId, detail),
+    });
+  }
+
+  return options;
+};
+
+/** Runs `opencode models --verbose`; resolves null on any failure so callers fall back to the curated list. */
+const fetchOpenCodeModelsLive = (): Promise<ProviderModelOption[] | null> =>
+  new Promise((resolve) => {
+    let settled = false;
+    const finish = (result: ProviderModelOption[] | null) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      resolve(result);
+    };
+
+    let child: ReturnType<typeof spawn>;
+    try {
+      child = spawn('opencode', ['models', '--verbose'], { stdio: ['ignore', 'pipe', 'ignore'] });
+    } catch {
+      finish(null);
+      return;
+    }
+
+    const timeout = setTimeout(() => {
+      child.kill();
+      finish(null);
+    }, OPENCODE_LIVE_MODELS_TIMEOUT_MS);
+
+    let stdout = '';
+    child.stdout?.on('data', (chunk: Buffer) => {
+      stdout += chunk.toString('utf8');
+    });
+    child.on('error', () => {
+      clearTimeout(timeout);
+      finish(null);
+    });
+    child.on('close', (code) => {
+      clearTimeout(timeout);
+      if (code !== 0) {
+        finish(null);
+        return;
+      }
+      const options = parseOpenCodeModelsOutput(stdout);
+      finish(options.length > 0 ? options : null);
+    });
+  });
+
+/** Live catalog with a short cache, falling back to {@link OPENCODE_PREDEFINED_MODELS} on any failure. */
+const toOpenCodeModelsDefinition = (options: ProviderModelOption[]): ProviderModelsDefinition => ({
+  OPTIONS: options,
+  // Which providers OpenCode can address depends on the user's credentials, so the curated default
+  // is only usable when it is actually in the live catalog.
+  DEFAULT: options.some((option) => option.value === OPENCODE_PREDEFINED_MODELS.DEFAULT)
+    ? OPENCODE_PREDEFINED_MODELS.DEFAULT
+    : options[0]?.value ?? OPENCODE_PREDEFINED_MODELS.DEFAULT,
+});
+
+
 const parseOpenCodeSessionModelValue = (rawModel: unknown): string | null => {
   if (typeof rawModel === 'string') {
     const trimmed = rawModel.trim();
@@ -430,11 +560,31 @@ const parseOpenCodeSessionModelValue = (rawModel: unknown): string | null => {
 
 /** Provider registry model adapter for OpenCode predefined models and session metadata. */
 export class OpenCodeProviderModels implements IProviderModels {
+  private readonly fetchLiveModels: OpenCodeLiveModelsFetcher;
+
+  private liveModelsCache: { options: ProviderModelOption[]; fetchedAt: number } | null = null;
+
+  constructor(fetchLiveModels: OpenCodeLiveModelsFetcher = fetchOpenCodeModelsLive) {
+    this.fetchLiveModels = fetchLiveModels;
+  }
+
+  /**
+   * The CLI's own `opencode models` list first, since it reflects exactly what the install can
+   * route to; the curated list filtered by connected providers when the CLI is unavailable.
+   */
   async getSupportedModels(): Promise<ProviderModelsDefinition> {
-    return filterOpenCodeModelsByProvider(
-      OPENCODE_PREDEFINED_MODELS,
-      await readConnectedOpenCodeProviderIds(),
-    );
+    const now = Date.now();
+    if (this.liveModelsCache && now - this.liveModelsCache.fetchedAt < OPENCODE_LIVE_MODELS_CACHE_TTL_MS) {
+      return toOpenCodeModelsDefinition(this.liveModelsCache.options);
+    }
+
+    const liveOptions = await this.fetchLiveModels();
+    if (liveOptions) {
+      this.liveModelsCache = { options: liveOptions, fetchedAt: now };
+      return toOpenCodeModelsDefinition(liveOptions);
+    }
+
+    return filterOpenCodeModelsByProvider(OPENCODE_PREDEFINED_MODELS, await readConnectedOpenCodeProviderIds());
   }
 
   async getCurrentActiveModel(sessionId?: string): Promise<ProviderCurrentActiveModel> {

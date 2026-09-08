@@ -207,15 +207,18 @@ export const api = {
   // config endpoint removed - no longer needed (frontend uses window.location)
   // After the projectName → projectId migration the path/query identifier is
   // the DB-assigned `projectId`; parameter names reflect that for clarity.
-  projects: () => get('/api/projects'),
-  archivedProjects: () => get('/api/projects/archived'),
+  // `provider` (optional) is the sidebar CLI filter: a comma-separated list of
+  // provider ids. The server filters both the returned rows and the session
+  // counts; absent or empty means every provider.
+  projects: (provider?: string) => get(`/api/projects${query({ provider })}`),
+  archivedProjects: (provider?: string) => get(`/api/projects/archived${query({ provider })}`),
   projectSessions: (
     projectId: string,
-    { limit = 20, offset = 0 }: { limit?: number; offset?: number } = {},
+    { limit = 20, offset = 0, provider }: { limit?: number; offset?: number; provider?: string } = {},
     options: ApiRequestOptions = {},
   ) =>
     get(
-      `/api/projects/${encodeURIComponent(projectId)}/sessions${query({ limit, offset })}`,
+      `/api/projects/${encodeURIComponent(projectId)}/sessions${query({ limit, offset, provider })}`,
       options,
     ),
   projectTaskmaster: (projectId: string) =>
@@ -259,14 +262,16 @@ export const api = {
   // - hardDelete: remove the row and, by default, its persisted transcript file
   deleteSession: (sessionId: string, hardDelete = false) =>
     del(`/api/providers/sessions/${sessionId}${query({ force: hardDelete })}`),
-  getArchivedSessions: () => get('/api/providers/sessions/archived'),
+  getArchivedSessions: (provider?: string) => get(`/api/providers/sessions/archived${query({ provider })}`),
   // Resolves one session (by app id or provider-native id) to its metadata and
   // owning project — used when a /session/<id> URL isn't in loaded payloads.
   sessionDetails: (sessionId: string) =>
     get(`/api/providers/sessions/${encodeURIComponent(sessionId)}`),
   runningSessions: () => get('/api/providers/sessions/running'),
-  recentConversations: ({ limit = 40, offset = 0 }: { limit?: number; offset?: number } = {}) =>
-    get(`/api/providers/sessions/recent${query({ limit, offset })}`),
+  recentConversations: (
+    { limit = 40, offset = 0, provider }: { limit?: number; offset?: number; provider?: string } = {},
+  ) =>
+    get(`/api/providers/sessions/recent${query({ limit, offset, provider })}`),
   providerSessionId: (sessionId: string) =>
     get(`/api/providers/sessions/${encodeURIComponent(sessionId)}/provider-id`),
   restoreSession: (sessionId: string) => post(`/api/providers/sessions/${sessionId}/restore`),

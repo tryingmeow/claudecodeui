@@ -28,6 +28,7 @@ export type UserPreferences = {
   codeEditorSettings: unknown;
   uiPreferences: unknown;
   selectedProvider: string;
+  sidebarProviderFilter: unknown;
 };
 
 export type UserPreferenceKey = keyof UserPreferences;
@@ -67,6 +68,7 @@ const LEGACY_STORAGE_KEYS: Record<UserPreferenceKey, string> = {
   codeEditorSettings: '',
   uiPreferences: 'uiPreferences',
   selectedProvider: 'selected-provider',
+  sidebarProviderFilter: 'sidebar-provider-filter',
 };
 
 const PREFERENCE_KEYS = Object.keys(LEGACY_STORAGE_KEYS) as UserPreferenceKey[];

@@ -10,6 +10,7 @@ import { closeConnection, initializeDatabase } from '@/modules/database/index.js
 import {
   OpenCodeProviderModels,
   OPENCODE_PREDEFINED_MODELS,
+  parseOpenCodeModelsOutput,
 } from '@/modules/providers/list/opencode/opencode-models.provider.js';
 
 const OPENCODE_ENV_KEYS = ['OPENCODE_API_KEY', 'ANTHROPIC_API_KEY', 'OPENAI_API_KEY'];
@@ -34,7 +35,8 @@ const withOpenCodeHome = async (
 
   try {
     await setUp(homeDir);
-    await runTest(new OpenCodeProviderModels());
+    // No live CLI: these cases exercise the curated fallback.
+    await runTest(new OpenCodeProviderModels(async () => null));
   } finally {
     (os as any).homedir = originalHomedir;
     for (const [key, value] of originalEnv) {
@@ -296,4 +298,40 @@ test('OpenCode composes the provider prefix into session model ids', async () =>
     }
     await rm(tempSessionsDirectory, { recursive: true, force: true });
   }
+});
+
+test('OpenCode prefers the live CLI catalog and keeps the curated default only when it is live', async () => {
+  const live = new OpenCodeProviderModels(async () => [
+    { value: 'anthropic/claude-opus-5', label: 'Claude Opus 5' },
+    { value: 'opencode/gpt-5.6-terra', label: 'GPT-5.6 Terra' },
+  ]);
+  const catalog = await live.getSupportedModels();
+  assert.deepEqual(catalog.OPTIONS.map((option) => option.value), ['anthropic/claude-opus-5', 'opencode/gpt-5.6-terra']);
+  assert.equal(catalog.DEFAULT, OPENCODE_PREDEFINED_MODELS.DEFAULT);
+
+  const withoutDefault = new OpenCodeProviderModels(async () => [
+    { value: 'openrouter/some-model', label: 'Some model' },
+  ]);
+  assert.equal((await withoutDefault.getSupportedModels()).DEFAULT, 'openrouter/some-model');
+});
+
+test('OpenCode verbose model output parses into options and skips deprecated models', () => {
+  const stdout = [
+    'opencode/gpt-5.6-terra',
+    '{',
+    '  "name": "GPT-5.6 Terra",',
+    '  "cost": { "input": 0, "output": 0 }',
+    '}',
+    'anthropic/claude-old',
+    '{',
+    '  "name": "Old",',
+    '  "status": "deprecated"',
+    '}',
+    'openrouter/plain-model',
+  ].join('\n');
+
+  assert.deepEqual(parseOpenCodeModelsOutput(stdout), [
+    { value: 'opencode/gpt-5.6-terra', label: 'GPT-5.6 Terra', description: 'OpenCode Zen · Free' },
+    { value: 'openrouter/plain-model', label: 'plain-model', description: 'openrouter' },
+  ]);
 });

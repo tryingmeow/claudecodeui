@@ -10,6 +10,11 @@ import type { ServerEvent,
   ProjectSession,IsSessionProcessing } from '@/shared/types';
 import { mergeProjectSelectionMetadata } from '@/modules/project-workspace/utils/projectSelectionMetadata';
 import { readSelectedProvider } from '@/shared/selectedProvider';
+import {
+  isProviderHiddenBySidebarFilter,
+  readSidebarProviderFilterParam,
+} from '@/shared/sidebarProviderFilter';
+import { useSidebarProviderFilter } from '@/shared/hooks/useSidebarProviderFilter';
 
 type UseProjectsStateArgs = {
   sessionId?: string;
@@ -45,6 +50,13 @@ type SessionUpsertedEvent = ServerEvent & {
 
 type FetchProjectsOptions = {
   showLoadingState?: boolean;
+  /**
+   * Replace the loaded list instead of merging it with what is already in
+   * state. Used when the sidebar CLI filter changes: merging would keep extra
+   * session pages of now-hidden providers and desync the server-computed
+   * `sessionMeta.total` and pagination offsets.
+   */
+  reset?: boolean;
 };
 
 type RegisterOptimisticSessionArgs = {
@@ -508,7 +520,7 @@ export function useProjectsState({
     });
   }, []);
 
-  const fetchProjects = useCallback(async ({ showLoadingState = true }: FetchProjectsOptions = {}) => {
+  const fetchProjects = useCallback(async ({ showLoadingState = true, reset = false }: FetchProjectsOptions = {}) => {
     // Claimed before the request starts and read again in `finally`, so the
     // loading flag is only ever cleared by the response that actually wrote
     // `projects`.
@@ -518,7 +530,7 @@ export function useProjectsState({
       if (showLoadingState) {
         setIsLoadingProjects(true);
       }
-      const response = await api.projects();
+      const response = await api.projects(readSidebarProviderFilterParam());
       const projectData = (await response.json()) as Project[];
 
       if (projectsRequestIdRef.current !== requestId) {
@@ -527,6 +539,10 @@ export function useProjectsState({
 
       setProjects((prevProjects) => {
         const projectsWithTaskMaster = mergeTaskMasterCache(projectData, prevProjects);
+        if (reset) {
+          return projectsWithTaskMaster;
+        }
+
         const mergedProjects = mergeExpandedSessionPages(prevProjects, projectsWithTaskMaster);
 
         if (prevProjects.length === 0) {
@@ -702,6 +718,22 @@ export function useProjectsState({
     void fetchProjects();
   }, [fetchProjects]);
 
+  // The sidebar CLI filter is applied by the server to the rows and the
+  // counts alike, so a change re-fetches page 1 and replaces the list rather
+  // than filtering in memory. The mount fetch above already used the current
+  // selection, so only an actual change (a toggle, or a hydrate that brings
+  // another device's choice) triggers this.
+  const { providerFilterKey } = useSidebarProviderFilter();
+  const lastProviderFilterKeyRef = useRef(providerFilterKey);
+  useEffect(() => {
+    if (lastProviderFilterKeyRef.current === providerFilterKey) {
+      return;
+    }
+
+    lastProviderFilterKeyRef.current = providerFilterKey;
+    void fetchProjects({ showLoadingState: false, reset: true });
+  }, [fetchProjects, providerFilterKey]);
+
   useEffect(() => {
     if (!selectedProject?.projectId) {
       return;
@@ -798,6 +830,19 @@ export function useProjectsState({
         const existingProject = previousProjects.find((project) =>
           targetProjectId ? project.projectId === targetProjectId : getProjectSessions(project).some((session) => session.id === upsert.sessionId),
         );
+
+        // With the sidebar CLI filter on, a session of a hidden provider is
+        // not added; a row that is already listed (e.g. the chat just
+        // started here) still receives its updates.
+        if (isProviderHiddenBySidebarFilter(upsert.provider)) {
+          const aliasIds = getSessionAliasIds(upsert);
+          const alreadyListed = existingProject
+            ? getProjectSessions(existingProject).some((session) => aliasIds.has(String(session.id)))
+            : false;
+          if (!alreadyListed) {
+            return previousProjects;
+          }
+        }
 
         if (!existingProject) {
           // First session of a project this client has never seen: create the
@@ -1092,7 +1137,7 @@ export function useProjectsState({
 
   const handleSidebarRefresh = useCallback(async () => {
     try {
-      const response = await api.projects();
+      const response = await api.projects(readSidebarProviderFilterParam());
       const freshProjects = (await response.json()) as Project[];
       const projectsWithTaskMaster = mergeTaskMasterCache(freshProjects, projects);
       const mergedProjects = mergeExpandedSessionPages(projects, projectsWithTaskMaster);
@@ -1206,6 +1251,9 @@ export function useProjectsState({
     const response = await api.projectSessions(projectId, {
       limit: 20,
       offset: loadedCount,
+      // The offset counts the loaded (already filtered) rows, so the page
+      // request has to carry the same filter.
+      provider: readSidebarProviderFilterParam(),
     });
 
     if (!response.ok) {

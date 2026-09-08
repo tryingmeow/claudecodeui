@@ -2,7 +2,10 @@ import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
 import test from 'node:test';
 
-import { CODEX_PREDEFINED_MODELS } from '@/modules/providers/list/codex/codex-models.provider.js';
+import {
+  CODEX_PREDEFINED_MODELS,
+  parseCodexModelListResult,
+} from '@/modules/providers/list/codex/codex-models.provider.js';
 
 const require = createRequire(import.meta.url);
 
@@ -34,4 +37,35 @@ test('bundles a Codex CLI new enough to know the GPT-6 Sol and Luna models', () 
   const { version } = require('@openai/codex/package.json') as { version: string };
   const [major, minor] = version.split('.').map(Number);
   assert.ok(major > 0 || minor >= 155, `bundled @openai/codex ${version} predates 0.155.0`);
+});
+
+test('maps app-server model/list entries and skips hidden ones', () => {
+  const parsed = parseCodexModelListResult({
+    data: [
+      {
+        id: 'gpt-6-astra',
+        model: 'gpt-6-astra',
+        displayName: 'GPT-6 Astra',
+        description: 'Live description',
+        hidden: false,
+        isDefault: true,
+        defaultReasoningEffort: 'medium',
+        supportedReasoningEfforts: [
+          { reasoningEffort: 'low', description: 'Fast' },
+          { reasoningEffort: 'medium', description: '' },
+        ],
+      },
+      { id: 'internal-model', displayName: 'Internal', hidden: true, supportedReasoningEfforts: [] },
+      // No live efforts: the curated entry for the same id supplies them.
+      { id: 'gpt-6-luna', displayName: 'GPT-6 Luna', hidden: false, supportedReasoningEfforts: [] },
+    ],
+  });
+
+  assert.deepEqual(parsed.options.map((option) => option.value), ['gpt-6-astra', 'gpt-6-luna']);
+  assert.equal(parsed.defaultValue, 'gpt-6-astra');
+  assert.deepEqual(parsed.options[0].effort, {
+    default: 'medium',
+    values: [{ value: 'low', description: 'Fast' }, { value: 'medium' }],
+  });
+  assert.deepEqual(parsed.options[1].effort, findCodexModel('gpt-6-luna')?.effort);
 });

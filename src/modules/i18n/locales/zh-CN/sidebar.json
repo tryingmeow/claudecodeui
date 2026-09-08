@@ -132,6 +132,8 @@
     "modeProjects": "项目",
     "modeConversations": "对话",
     "modeMore": "更多",
+    "providerFilterLabel": "按 CLI 筛选会话",
+    "providerFilterOption": "只显示 {{provider}} 会话",
     "conversationsPlaceholder": "搜索对话内容...",
     "searching": "搜索中...",
     "sessionTitles": "会话标题",

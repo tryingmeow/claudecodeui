@@ -23,6 +23,7 @@ import type {
   AnyRecord,
   ApiSuccessShape,
   AppErrorOptions,
+  LLMProvider,
   NormalizedMessage,
   ProviderCurrentActiveModel,
   ProviderModelsDefinition,
@@ -579,6 +580,43 @@ export const readObjectRecord = (value: any): AnyRecord | null => {
 
   return value as AnyRecord;
 };
+
+/** Provider ids accepted by the `provider` session-filter query parameter. */
+const SESSION_FILTER_PROVIDER_IDS: readonly LLMProvider[] = ['claude', 'codex', 'cursor', 'opencode'];
+
+/**
+ * Parses the shared `?provider=` session filter query parameter.
+ *
+ * The value is a comma-separated list of provider ids. Unknown ids, blanks, and
+ * duplicates are dropped rather than rejected, so a stale or hand-edited client
+ * URL degrades to "no filter" instead of a failed sidebar load. Returns
+ * `undefined` whenever no valid id survives, which every downstream service and
+ * repository treats as "return everything".
+ */
+export function parseProviderFilterQuery(value: unknown): LLMProvider[] | undefined {
+  const rawValues: string[] = Array.isArray(value)
+    ? value.filter((entry): entry is string => typeof entry === 'string')
+    : typeof value === 'string'
+      ? [value]
+      : [];
+
+  const providers: LLMProvider[] = [];
+  for (const rawValue of rawValues) {
+    for (const candidate of rawValue.split(',')) {
+      const normalized = candidate.trim();
+      if (!normalized) {
+        continue;
+      }
+
+      const provider = SESSION_FILTER_PROVIDER_IDS.find((entry) => entry === normalized);
+      if (provider && !providers.includes(provider)) {
+        providers.push(provider);
+      }
+    }
+  }
+
+  return providers.length > 0 ? providers : undefined;
+}
 
 /**
  * Reads an optional string from unknown input and normalizes empty or whitespace-only
@@ -1137,16 +1175,19 @@ export async function readFileTimestamps(
 // ---------------------------
 //----------------- SESSION SYNCHRONIZER JSONL PARSING HELPERS ------------
 /**
- * Builds a first-seen key/value lookup map from a JSONL file.
+ * Builds a key/value lookup map from a JSONL file.
  *
  * Use this for provider index files where session id -> display name metadata
- * is stored line-by-line. The first value for each key wins, preserving the
- * earliest known label while avoiding repeated map overwrites.
+ * is stored line-by-line. The first value for each key wins by default, which
+ * suits append-only logs of distinct events. Pass `keepLastValue` for index
+ * files a provider rewrites in place — there the newest line for a key is the
+ * current label and the earliest one is a stale placeholder.
  */
 export async function buildLookupMap(
   filePath: string,
   keyField: string,
-  valueField: string
+  valueField: string,
+  keepLastValue = false
 ): Promise<Map<string, string>> {
   const lookup = new Map<string, string>();
 
@@ -1164,7 +1205,7 @@ export async function buildLookupMap(
       const key = parsed[keyField];
       const value = parsed[valueField];
 
-      if (typeof key === 'string' && typeof value === 'string' && !lookup.has(key)) {
+      if (typeof key === 'string' && typeof value === 'string' && (keepLastValue || !lookup.has(key))) {
         lookup.set(key, value);
       }
     }

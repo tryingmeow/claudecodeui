@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { TFunction } from 'i18next';
 
 import { api } from '@/shared/api';
+import { useSidebarProviderFilter } from '@/shared/hooks/useSidebarProviderFilter';
 import { subscribeToUserPreferences } from '@/shared/userSettings';
 import { usePaletteOps } from '@/modules/command-palette';
 import type { ArchivedProjectListItem, ArchivedSessionListItem, ConversationProjectResult, ConversationSearchResults, LLMProvider, Project, ProjectSession, ProjectSortOrder, RecentConversationListItem, SearchProgress, ActiveSidebarRename, PendingSidebarDeletion, SessionTitleSearchResult, SessionWithProvider, SidebarSearchMode, SidebarSessionSelection } from '@/shared/types';
@@ -127,6 +128,11 @@ export function useSidebarController({
   const [loadingMoreProjects, setLoadingMoreProjects] = useState<Set<string>>(new Set());
   const searchSeqRef = useRef(0);
   const recentConversationsSeqRef = useRef(0);
+  const archivedSessionsSeqRef = useRef(0);
+  // Sidebar CLI filter for the archive and recent-conversation lists fetched
+  // here; the project list is fed by useProjectsState, which reads the same
+  // preference.
+  const { providerFilterKey } = useSidebarProviderFilter();
   const eventSourceRef = useRef<EventSource | null>(null);
   const starToggleSequenceByProjectRef = useRef<Map<string, number>>(new Map());
   const migrationStartedRef = useRef(false);
@@ -196,12 +202,14 @@ export function useSidebarController({
   }, [onRefresh]);
 
   const fetchArchivedSessions = useCallback(async () => {
+    const requestSequence = ++archivedSessionsSeqRef.current;
     setIsArchivedSessionsLoading(true);
 
     try {
+      const providerFilterParam = providerFilterKey || undefined;
       const [archivedProjectsResponse, archivedSessionsResponse] = await Promise.all([
-        api.archivedProjects(),
-        api.getArchivedSessions(),
+        api.archivedProjects(providerFilterParam),
+        api.getArchivedSessions(providerFilterParam),
       ]);
 
       if (!archivedProjectsResponse.ok) {
@@ -220,14 +228,23 @@ export function useSidebarController({
         ? archivedSessionsPayload.data.sessions.filter((session) => !session.projectId || !archivedProjectIds.has(session.projectId))
         : [];
 
+      // A filter toggled while this was in flight started a newer request.
+      if (requestSequence !== archivedSessionsSeqRef.current) {
+        return;
+      }
+
       setArchivedProjects(nextProjects);
       setArchivedSessions(nextStandaloneSessions);
     } catch (error) {
       console.error('[Sidebar] Failed to load archived sessions:', error);
     } finally {
-      setIsArchivedSessionsLoading(false);
+      if (requestSequence === archivedSessionsSeqRef.current) {
+        setIsArchivedSessionsLoading(false);
+      }
     }
-  }, []);
+    // Identity changes with the filter, so the effects that call this re-fetch
+    // the archive instead of keeping rows of now-hidden providers.
+  }, [providerFilterKey]);
 
   const fetchRecentConversationsPage = useCallback(async (offset: number, append: boolean) => {
     const requestSequence = ++recentConversationsSeqRef.current;
@@ -239,7 +256,11 @@ export function useSidebarController({
     setRecentConversationsError(false);
 
     try {
-      const response = await api.recentConversations({ limit: 40, offset });
+      const response = await api.recentConversations({
+        limit: 40,
+        offset,
+        provider: providerFilterKey || undefined,
+      });
       if (!response.ok) {
         throw new Error(`Failed to load recent conversations: ${response.status}`);
       }
@@ -278,7 +299,9 @@ export function useSidebarController({
         setIsLoadingMoreRecentConversations(false);
       }
     }
-  }, []);
+    // A filter change invalidates the loaded offsets, so the identity changes
+    // and the reload effect re-fetches from offset 0.
+  }, [providerFilterKey]);
 
   const reloadRecentConversations = useCallback(() => {
     void fetchRecentConversationsPage(0, false);

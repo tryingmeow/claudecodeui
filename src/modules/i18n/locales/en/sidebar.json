@@ -133,6 +133,8 @@
     "modeProjects": "Projects",
     "modeConversations": "Conversations",
     "modeMore": "More",
+    "providerFilterLabel": "Filter sessions by CLI",
+    "providerFilterOption": "Show only {{provider}} sessions",
     "conversationsPlaceholder": "Search in conversations...",
     "searching": "Searching...",
     "sessionTitles": "Session",

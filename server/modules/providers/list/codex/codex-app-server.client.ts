@@ -72,6 +72,7 @@ function resolveCodexLauncher(): string {
  */
 async function withAppServer<T>(
   run: (call: (method: string, params: unknown) => Promise<unknown>) => Promise<T>,
+  { requestTimeoutMs = REQUEST_TIMEOUT_MS }: { requestTimeoutMs?: number } = {},
 ): Promise<T> {
   const launcher = resolveCodexLauncher();
   const child = spawn(process.execPath, [launcher, 'app-server'], {
@@ -144,11 +145,11 @@ async function withAppServer<T>(
       const id = nextRequestId++;
       const timer = setTimeout(() => {
         pending.delete(id);
-        reject(new AppError(`Codex app-server did not answer "${method}" within ${REQUEST_TIMEOUT_MS}ms.`, {
+        reject(new AppError(`Codex app-server did not answer "${method}" within ${requestTimeoutMs}ms.`, {
           code: 'CODEX_APP_SERVER_TIMEOUT',
           statusCode: 504,
         }));
-      }, REQUEST_TIMEOUT_MS);
+      }, requestTimeoutMs);
 
       pending.set(id, (response) => {
         clearTimeout(timer);
@@ -191,7 +192,34 @@ async function withAppServer<T>(
   }
 }
 
+/** Upper bound on `model/list` pages, so a server that keeps returning a cursor cannot loop forever. */
+const MODEL_LIST_MAX_PAGES = 20;
+
 export const codexAppServer = {
+  /**
+   * Returns the raw `model/list` entries (protocol `Model` objects) the bundled
+   * CLI reports for the configured account and model provider, following the
+   * pagination cursor. Hidden models are left out by the server by default.
+   */
+  async listModels({ requestTimeoutMs }: { requestTimeoutMs?: number } = {}): Promise<unknown[]> {
+    return withAppServer(async (call) => {
+      const models: unknown[] = [];
+      let cursor: string | null = null;
+      for (let page = 0; page < MODEL_LIST_MAX_PAGES; page += 1) {
+        const result = await call('model/list', cursor ? { cursor } : {}) as
+          { data?: unknown; nextCursor?: unknown } | undefined;
+        if (Array.isArray(result?.data)) {
+          models.push(...result.data);
+        }
+        cursor = typeof result?.nextCursor === 'string' && result.nextCursor ? result.nextCursor : null;
+        if (!cursor) {
+          break;
+        }
+      }
+      return models;
+    }, { requestTimeoutMs });
+  },
+
   /**
    * Copies a thread into a new one that ends at `lastTurnId`, or copies the
    * whole thread when it is omitted.
