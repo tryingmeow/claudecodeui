@@ -241,12 +241,11 @@ function mapPermissionModeToCodexOptions(permissionMode: string): Pick<ThreadOpt
       };
     case 'default':
     default:
-      return {
-        sandboxMode: 'workspace-write',
-        // Current Codex CLI versions reject the retired `untrusted` policy.
-        // Keep sandboxing enabled; exec cannot grant interactive approval requests.
-        approvalPolicy: 'on-request'
-      };
+      // Default passes neither option, so the Codex CLI applies `sandbox_mode`
+      // and `approval_policy` from its own config (~/.codex/config.toml) and a
+      // CloudCLI-launched session behaves exactly like one started in the
+      // terminal on the same machine.
+      return {};
   }
 }
 

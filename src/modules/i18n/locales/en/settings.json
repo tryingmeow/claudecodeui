@@ -494,7 +494,7 @@
       "modes": {
         "default": {
           "title": "Default",
-          "description": "Runs commands within the workspace sandbox. Codex decides when approval is needed; requests cannot be approved in this non-interactive integration."
+          "description": "Uses the sandbox and approval policy from your Codex config (~/.codex/config.toml), the same as running Codex in a terminal on this machine."
         },
         "acceptEdits": {
           "title": "Accept Edits",
@@ -507,7 +507,7 @@
       },
       "technicalDetails": "Technical details",
       "technicalInfo": {
-        "default": "sandboxMode=workspace-write, approvalPolicy=on-request. Runs commands within the workspace sandbox. Codex decides when approval is needed; requests cannot be approved in this non-interactive integration.",
+        "default": "No sandboxMode or approvalPolicy is passed; Codex applies sandbox_mode and approval_policy from ~/.codex/config.toml.",
         "acceptEdits": "sandboxMode=workspace-write, approvalPolicy=never. All commands auto-execute within project directory.",
         "bypassPermissions": "sandboxMode=danger-full-access, approvalPolicy=never. Full system access, use only in trusted environments.",
         "overrideNote": "You can override this per-session using the mode button in the chat interface."

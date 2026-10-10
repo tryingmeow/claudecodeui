@@ -50,8 +50,13 @@ for (const resumed of [false, true]) {
       assert.equal(start.mock.callCount(), resumed ? 0 : 1);
       assert.equal(resume.mock.callCount(), resumed ? 1 : 0);
       assert.equal(capturedPrompt, 'hey there');
-      assert.equal(capturedOptions?.sandboxMode, permissionMode === 'bypassPermissions' ? 'danger-full-access' : 'workspace-write');
-      assert.equal(capturedOptions?.approvalPolicy, permissionMode === 'acceptEdits' || permissionMode === 'bypassPermissions' ? 'never' : 'on-request');
+      // Default (and anything unrecognised) defers to the Codex CLI's own config.
+      const explicit = permissionMode === 'acceptEdits' || permissionMode === 'bypassPermissions';
+      assert.equal(
+        capturedOptions?.sandboxMode,
+        permissionMode === 'bypassPermissions' ? 'danger-full-access' : explicit ? 'workspace-write' : undefined,
+      );
+      assert.equal(capturedOptions?.approvalPolicy, explicit ? 'never' : undefined);
       assert.ok(messages.some((message: any) => message.kind === 'complete' && message.exitCode === 0));
       assert.ok(!messages.some((message: any) => message.kind === 'error'));
     });
