@@ -291,6 +291,11 @@ function mapCliOptionsToSDK(options = {}) {
 
   sdkOptions.settingSources = ['project', 'user', 'local'];
 
+  // In SDK mode the CLI ignores the `showThinkingSummaries` setting, and newer models
+  // return empty thinking blocks unless a display is requested. Ask only for the display
+  // so the CLI still decides whether thinking runs for the selected model.
+  sdkOptions.extraArgs = { ...(sdkOptions.extraArgs || {}), 'thinking-display': 'summarized' };
+
   // The SDK resumes with the provider-native session id, never the app id.
   // `resumeFromScratch` is set when the very first prompt of a conversation was
   // edited: there is nothing before it to resume through, so the turn has to
