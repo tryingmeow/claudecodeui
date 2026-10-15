@@ -314,5 +314,11 @@
     "effortLevels": "推理等級",
     "effortLevelsHint": "選擇此模型支援的推理強度等級。若未選擇任何等級，將無法在輸入框中為此模型選擇等級。",
     "effortSummary": "推理：{{levels}}"
+  },
+  "fileCard": {
+    "download": "下載",
+    "downloading": "正在下載…",
+    "failed": "下載失敗，點擊重試",
+    "ariaLabel": "下載 {{name}}"
   }
 }

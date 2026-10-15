@@ -5,6 +5,7 @@ import { ImageOff } from 'lucide-react';
 import { api } from '@/shared/api';
 import { useMarkdownWorkspaceProjectId } from '@/modules/chat/context/MarkdownWorkspaceContext';
 import { ImageLightbox } from '@/modules/chat/transcript/ChatMessageImages';
+import { toWorkspacePath } from '@/modules/chat/utils/workspaceFileLinks';
 
 type MarkdownImageProps = {
   node?: unknown;
@@ -16,25 +17,6 @@ type MarkdownImageProps = {
 // Sources the browser can load on its own. Anything else is a workspace file
 // reference and has to go through the authenticated project files route.
 const isBrowserLoadableSrc = (src: string): boolean => /^(https?:|data:|blob:)/i.test(src);
-
-// Turn the markdown src into the path the file-tree route expects. Relative
-// paths are resolved against the project root server-side; absolute paths are
-// accepted as long as they stay inside it.
-const toWorkspacePath = (src: string): string => {
-  let workspacePath = src.trim();
-  if (workspacePath.startsWith('file://')) {
-    workspacePath = workspacePath.slice('file://'.length);
-  }
-  if (workspacePath.startsWith('./')) {
-    workspacePath = workspacePath.slice(2);
-  }
-  try {
-    workspacePath = decodeURI(workspacePath);
-  } catch {
-    // Keep the raw value when it is not valid percent-encoding.
-  }
-  return workspacePath;
-};
 
 type LoadedImage = { key: string; url: string | null; failed: boolean };
 

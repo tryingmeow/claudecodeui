@@ -9,8 +9,10 @@ import { useTranslation } from 'react-i18next';
 
 import { MermaidDiagram } from '@/modules/code-editor';
 import { MarkdownImage } from '@/modules/chat/transcript/MarkdownImage';
+import { MarkdownFileCard } from '@/modules/chat/transcript/MarkdownFileCard';
 import { normalizeInlineCodeFences } from '@/modules/chat/utils/chatFormatting';
 import { normalizeLatexDelimiters } from '@/modules/chat/utils/latexDelimiters';
+import { deliverableFileKind } from '@/modules/chat/utils/workspaceFileLinks';
 import { copyTextToClipboard } from '@/shared/utils';
 import { SyntaxHighlighter } from '@/shared/syntaxHighlighter';
 import { usePaletteOps } from '@/modules/command-palette';
@@ -66,6 +68,14 @@ const childrenToText = (children: React.ReactNode): string => {
   }
   return '';
 };
+
+// A link wrapped around an inline image (`[![shot](a.png)](a.png)`) keeps the
+// image preview instead of turning into a download card.
+const containsImage = (children: React.ReactNode): boolean =>
+  React.Children.toArray(children).some(
+    (child) => React.isValidElement(child)
+      && (child.type === MarkdownImage || containsImage((child.props as { children?: React.ReactNode }).children)),
+  );
 
 // The only delimiter `remark-math` recognizes with `singleDollarTextMath` off.
 // `\(…\)` and `\[…\]` are already rewritten to `$$` by normalizeLatexDelimiters,
@@ -293,6 +303,12 @@ function MarkdownBodyRenderer({ children, breaks = false }: Omit<MarkdownProps, 
         // link text, since models often emit `[src/foo.ts]()` with an empty href.
         const linkText = childrenToText(linkChildren);
         const fileRef = looksLikeFilePath(href) ? href : looksLikeFilePath(linkText) ? linkText : undefined;
+
+        // Documents, sheets, archives and media are something to save, not to
+        // read as code: they render as a card that downloads the file.
+        if (fileRef && !isExternalHref(href) && deliverableFileKind(fileRef) && !containsImage(linkChildren)) {
+          return <MarkdownFileCard reference={fileRef} />;
+        }
 
         if (fileRef && !isExternalHref(href)) {
           return (
