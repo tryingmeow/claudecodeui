@@ -1,5 +1,6 @@
 import type { LLMProvider } from '@/shared/types';
 import { readUserPreference, writeUserPreference } from '@/shared/userSettings';
+import { isProviderEnabled } from '@/shared/enabledProviders';
 
 /**
  * The sidebar's "show only these CLIs" filter.
@@ -15,7 +16,8 @@ import { readUserPreference, writeUserPreference } from '@/shared/userSettings';
  */
 
 /** Every CLI the sidebar can list sessions for, in display order. */
-export const SIDEBAR_FILTER_PROVIDERS: readonly LLMProvider[] = ['claude', 'codex', 'cursor', 'opencode'];
+export const SIDEBAR_FILTER_PROVIDERS: readonly LLMProvider[] = (['claude', 'codex', 'cursor', 'opencode'] as const)
+  .filter(isProviderEnabled);
 
 const isFilterProvider = (value: unknown): value is LLMProvider =>
   typeof value === 'string' && (SIDEBAR_FILTER_PROVIDERS as readonly string[]).includes(value);

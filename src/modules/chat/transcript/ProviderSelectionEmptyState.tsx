@@ -25,13 +25,14 @@ import {
 import ModelGroupList, { type ModelGroup } from "@/modules/chat/composer/ModelGroupList";
 import ModelLibraryPanel from "@/modules/chat/modals/ModelLibraryPanel";
 import { writeSelectedProvider } from '@/shared/selectedProvider';
+import { isProviderEnabled } from '@/shared/enabledProviders';
 
-const PROVIDER_META: { id: LLMProvider; name: string }[] = [
+const PROVIDER_META = ([
   { id: "claude", name: "Anthropic" },
   { id: "codex", name: "OpenAI" },
   { id: "cursor", name: "Cursor" },
   { id: "opencode", name: "OpenCode" },
-];
+] satisfies { id: LLMProvider; name: string }[]).filter((meta) => isProviderEnabled(meta.id));
 
 const MOD_KEY =
   typeof navigator !== "undefined" && /Mac|iPhone|iPad/.test(navigator.platform) ? "⌘" : "Ctrl";

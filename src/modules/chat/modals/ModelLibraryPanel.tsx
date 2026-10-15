@@ -12,6 +12,7 @@ import {
 } from 'lucide-react';
 
 import { Badge, Button, Input, LLMProviderLogo } from '@/shared/ui';
+import { isProviderEnabled } from '@/shared/enabledProviders';
 import type {
   CustomProviderModelInput,
   LLMProvider,
@@ -20,12 +21,12 @@ import type {
   ProviderModelsDefinition,
 } from '@/shared/types';
 
-const PROVIDERS: Array<{ id: LLMProvider; label: string }> = [
+const PROVIDERS = ([
   { id: 'claude', label: 'Claude' },
   { id: 'codex', label: 'Codex' },
   { id: 'cursor', label: 'Cursor' },
   { id: 'opencode', label: 'OpenCode' },
-];
+] satisfies Array<{ id: LLMProvider; label: string }>).filter((entry) => isProviderEnabled(entry.id));
 
 type ModelLibraryPanelProps = {
   initialProvider: LLMProvider;

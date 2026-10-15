@@ -1,5 +1,6 @@
 import type { LLMProvider } from '@/shared/types';
 import { readUserPreference, writeUserPreference } from '@/shared/userSettings';
+import { isProviderEnabled } from '@/shared/enabledProviders';
 
 /**
  * The provider the user last chose, shared by chat, the shell, the git panel and
@@ -16,9 +17,9 @@ import { readUserPreference, writeUserPreference } from '@/shared/userSettings';
  * choice both reaches every reader at once and follows the user between devices.
  */
 
-const PROVIDERS: LLMProvider[] = ['claude', 'cursor', 'codex', 'opencode'];
+const PROVIDERS: LLMProvider[] = (['claude', 'cursor', 'codex', 'opencode'] as const).filter(isProviderEnabled);
 
-const DEFAULT_PROVIDER: LLMProvider = 'claude';
+const DEFAULT_PROVIDER: LLMProvider = PROVIDERS[0] ?? 'claude';
 
 export function readSelectedProvider(): LLMProvider {
   const stored = readUserPreference<string | null>('selectedProvider', null);

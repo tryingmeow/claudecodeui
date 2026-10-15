@@ -11,6 +11,7 @@ import type { PendingPermissionRequest, PermissionMode,
   ProviderModelsDefinition } from '@/shared/types';
 import { DEFAULT_EFFORT_VALUE } from '@/shared/constants';
 import { readSelectedProvider, writeSelectedProvider } from '@/shared/selectedProvider';
+import { isProviderEnabled } from '@/shared/enabledProviders';
 
 const FALLBACK_PROVIDER_EFFORT_VALUES: Partial<Record<LLMProvider, readonly string[]>> = {
   // Superset used only before the model catalog loads; `ultracode` belongs to the
@@ -193,8 +194,10 @@ export function useChatProviderState({ selectedSession, selectedProject: _select
     setProviderModelsLoading(true);
 
     try {
+      // Hidden CLIs get no catalog request, so the server never spawns them.
+      const catalogProviders = PROVIDERS.filter(isProviderEnabled);
       const results = await Promise.all(
-        PROVIDERS.map(async (p) => {
+        catalogProviders.map(async (p) => {
           const response = await api.providers.models(p);
           const body = (await response.json()) as ProviderModelsApiResponse;
           if (!body.success || !body.data?.models) {
@@ -211,7 +214,7 @@ export function useChatProviderState({ selectedSession, selectedProject: _select
 
       const nextCatalog: Partial<Record<LLMProvider, ProviderModelsDefinition>> = {};
 
-      PROVIDERS.forEach((p, i) => {
+      catalogProviders.forEach((p, i) => {
         const entry = results[i];
         if (!entry) {
           return;
