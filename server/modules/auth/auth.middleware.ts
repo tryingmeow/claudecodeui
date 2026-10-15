@@ -110,7 +110,9 @@ const generateToken = (user) => {
       username: user.username
     },
     JWT_SECRET,
-    { expiresIn: '7d' }
+    // A deployment whose users rarely sign back in (family phones) sets a longer
+    // lifetime, e.g. JWT_EXPIRES_IN=90d; tokens still auto-refresh past half-life.
+    { expiresIn: process.env.JWT_EXPIRES_IN || '7d' }
   );
 };
 
