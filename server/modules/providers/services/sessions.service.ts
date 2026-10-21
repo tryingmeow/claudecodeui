@@ -138,6 +138,11 @@ function resolveProjectDisplayName(
   return path.basename(projectPath) || projectPath;
 }
 
+/** Single-quotes a value for bash, escaping embedded single quotes. */
+function shellQuote(value: string): string {
+  return `'${value.replace(/'/g, `'\\''`)}'`;
+}
+
 /**
  * Application service for provider-backed session message operations.
  *
@@ -403,6 +408,47 @@ export const sessionsService = {
     }
 
     return session.provider_session_id;
+  },
+
+  /**
+   * Builds the shell command that resumes a session in the user's own terminal.
+   *
+   * Sessions started through the SDK are hidden from the CLI's `--resume`
+   * picker, but resuming by native id still works, as long as the shell is in
+   * the directory the session was launched from. Only Claude and Codex have a
+   * resumable CLI form; other providers are rejected.
+   */
+  getTerminalResumeCommand(sessionId: string): string {
+    const session = sessionsDb.getSessionById(sessionId);
+    if (!session) {
+      throw new AppError(`Session "${sessionId}" was not found.`, {
+        code: 'SESSION_NOT_FOUND',
+        statusCode: 404,
+      });
+    }
+
+    const providerSessionId = session.provider_session_id;
+    if (!providerSessionId) {
+      throw new AppError('This session ID is not available yet.', {
+        code: 'PROVIDER_SESSION_ID_NOT_AVAILABLE',
+        statusCode: 409,
+      });
+    }
+
+    const resumeCommand = session.provider === 'claude'
+      ? `claude --resume ${providerSessionId}`
+      : session.provider === 'codex'
+        ? `codex resume ${providerSessionId}`
+        : null;
+    if (!resumeCommand) {
+      throw new AppError('This provider has no terminal resume command.', {
+        code: 'TERMINAL_RESUME_UNSUPPORTED',
+        statusCode: 409,
+      });
+    }
+
+    const cwd = session.project_path?.trim();
+    return cwd ? `cd ${shellQuote(cwd)} && ${resumeCommand}` : resumeCommand;
   },
 
   /**

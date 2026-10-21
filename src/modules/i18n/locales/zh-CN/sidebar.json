@@ -41,6 +41,11 @@
     "deleteSelected_other": "删除 {{count}} 个会话"
   },
   "tooltips": {
+    "terminalResumeCopy": "复制终端恢复命令",
+    "terminalResumeLoading": "正在生成恢复命令…",
+    "terminalResumeCopied": "恢复命令已复制",
+    "terminalResumeCopyFailed": "无法复制恢复命令",
+    "terminalResumeUnavailable": "恢复命令不可用",
     "viewEnvironments": "查看环境",
     "hideSidebar": "隐藏侧边栏",
     "createProject": "创建新项目",

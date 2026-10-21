@@ -41,6 +41,11 @@
     "deleteSelected_other": "Delete {{count}} sessions"
   },
   "tooltips": {
+    "terminalResumeCopy": "Copy terminal resume command",
+    "terminalResumeLoading": "Preparing resume command…",
+    "terminalResumeCopied": "Resume command copied",
+    "terminalResumeCopyFailed": "Couldn't copy resume command",
+    "terminalResumeUnavailable": "Resume command unavailable",
     "viewEnvironments": "View Environments",
     "hideSidebar": "Hide sidebar",
     "createProject": "Create new project",

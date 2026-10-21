@@ -6,6 +6,7 @@ import type { TFunction } from 'i18next';
 import { Badge, Dialog, DialogContent, DialogTitle, LLMProviderLogo, Tooltip, buttonVariants } from '@/shared/ui';
 import { cn } from '@/shared/utils';
 import type { LLMProvider, Project, ProjectSession, SessionWithProvider } from '@/shared/types';
+import { useTerminalResumeCommandCopy } from '@/modules/sidebar/hooks/useTerminalResumeCommandCopy';
 import { PROVIDER_LABELS, createSessionViewModel, formatCompactAge } from '@/modules/sidebar/utils/sidebarProjectFormatting';
 import { useCompactSidebar } from '@/modules/sidebar/hooks/useCompactSidebar';
 import { useProviderSessionIdCopy } from '@/modules/sidebar/hooks/useProviderSessionIdCopy';
@@ -87,6 +88,7 @@ function SidebarSessionItem({
   // which owns its own.
   const { copyState, copyLabel, setOptionsOpen, handleCopyAction, isCopyPending, CopyStateIcon } =
     useProviderSessionIdCopy(session.id, providerLabel);
+  const resumeCopy = useTerminalResumeCommandCopy(session.id, session.__provider, t);
 
   // Sessions are owned by a project identified by `projectId` (DB primary key)
   // after the projectName → projectId migration.
@@ -133,6 +135,7 @@ function SidebarSessionItem({
   const setMobileOptionsOpen = (open: boolean) => {
     setIsMobileOptionsOpen(open);
     setOptionsOpen(open);
+    resumeCopy.setOptionsOpen(open);
     if (!open && isEditing) {
       onCancelEditingSession();
     }
@@ -346,6 +349,34 @@ function SidebarSessionItem({
                     )}
                   </span>
                 </button>
+
+                {resumeCopy.isSupported && (
+                  <button
+                    type="button"
+                    onClick={resumeCopy.handleCopyAction}
+                    disabled={resumeCopy.isCopyPending}
+                    className={cn(
+                      'flex min-h-12 w-full items-center gap-3 rounded-xl border px-4 py-3 text-left transition-colors',
+                      resumeCopy.copyState === 'copied'
+                        ? 'border-green-500/30 bg-green-500/10 text-green-700 dark:text-green-300'
+                        : resumeCopy.copyState === 'error'
+                          ? 'border-red-500/30 bg-red-500/10 text-red-700 dark:text-red-300'
+                          : 'border-border bg-muted/35 text-foreground active:bg-muted',
+                    )}
+                  >
+                    {resumeCopy.isCopyPending ? (
+                      <Loader2 className="h-5 w-5 flex-shrink-0 animate-spin" />
+                    ) : (
+                      <resumeCopy.CopyStateIcon className="h-5 w-5 flex-shrink-0" />
+                    )}
+                    <span className="min-w-0 flex-1">
+                      <span className="block text-sm font-medium">{resumeCopy.copyLabel}</span>
+                      {resumeCopy.copyState === 'error' && (
+                        <span className="mt-0.5 block text-xs">Tap to try again.</span>
+                      )}
+                    </span>
+                  </button>
+                )}
 
                 {!isProcessing && (
                   <button

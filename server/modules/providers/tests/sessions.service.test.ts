@@ -41,6 +41,27 @@ test('provider session id returns the mapped native id', { concurrency: false },
   });
 });
 
+test('terminal resume command cds into the project and quotes the path', { concurrency: false }, async () => {
+  await withIsolatedDatabase(() => {
+    sessionsDb.createAppSession('claude-app', 'claude', "/tmp/it's a project");
+    sessionsDb.assignProviderSessionId('claude-app', 'claude-native-id');
+    sessionsDb.createAppSession('codex-app', 'codex', '/tmp/codex-project');
+    sessionsDb.assignProviderSessionId('codex-app', 'codex-native-id');
+    sessionsDb.createAppSession('cursor-app', 'cursor', '/tmp/cursor-project');
+    sessionsDb.assignProviderSessionId('cursor-app', 'cursor-native-id');
+
+    assert.equal(
+      sessionsService.getTerminalResumeCommand('claude-app'),
+      `cd '/tmp/it'\\''s a project' && claude --resume claude-native-id`,
+    );
+    assert.equal(
+      sessionsService.getTerminalResumeCommand('codex-app'),
+      `cd '/tmp/codex-project' && codex resume codex-native-id`,
+    );
+    assert.throws(() => sessionsService.getTerminalResumeCommand('cursor-app'));
+  });
+});
+
 test('app session names use at most four whole words from the initial message', { concurrency: false }, async () => {
   await withIsolatedDatabase(() => {
     const result = sessionsService.createAppSession(

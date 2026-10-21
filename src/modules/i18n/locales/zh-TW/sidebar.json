@@ -41,6 +41,11 @@
     "deleteSelected_other": "刪除 {{count}} 個工作階段"
   },
   "tooltips": {
+    "terminalResumeCopy": "複製終端機恢復指令",
+    "terminalResumeLoading": "正在產生恢復指令…",
+    "terminalResumeCopied": "恢復指令已複製",
+    "terminalResumeCopyFailed": "無法複製恢復指令",
+    "terminalResumeUnavailable": "恢復指令無法使用",
     "viewEnvironments": "查看環境",
     "hideSidebar": "隱藏側邊欄",
     "createProject": "建立新專案",

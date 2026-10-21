@@ -913,6 +913,15 @@ router.get(
 );
 
 router.get(
+  '/sessions/:sessionId/terminal-resume-command',
+  asyncHandler(async (req: Request, res: Response) => {
+    const sessionId = parseSessionId(req.params.sessionId);
+    const command = sessionsService.getTerminalResumeCommand(sessionId);
+    res.json(createApiSuccessResponse({ command }));
+  }),
+);
+
+router.get(
   '/sessions/:sessionId/token-usage',
   asyncHandler(async (req: Request, res: Response) => {
     const sessionId = parseSessionId(req.params.sessionId);

@@ -1,4 +1,4 @@
-import { useEffect, useRef } from 'react';
+import { useCallback, useEffect, useRef } from 'react';
 import { Check, Edit2, GitBranch, MoreHorizontal, Trash2, X } from 'lucide-react';
 import type { TFunction } from 'i18next';
 
@@ -7,6 +7,7 @@ import { cn } from '@/shared/utils';
 import type { LLMProvider } from '@/shared/types';
 import { useSessionForkingProviders } from '@/shared/hooks/useProviderCapabilities';
 import { useProviderSessionIdCopy } from '@/modules/sidebar/hooks/useProviderSessionIdCopy';
+import { useTerminalResumeCommandCopy } from '@/modules/sidebar/hooks/useTerminalResumeCommandCopy';
 import { PROVIDER_LABELS } from '@/modules/sidebar/utils/sidebarProjectFormatting';
 
 type SessionOptionsProps = {
@@ -66,6 +67,11 @@ export default function SessionOptions({
   const providerLabel = PROVIDER_LABELS[provider];
   const { copyState, copyLabel, setOptionsOpen, handleCopyAction, isCopyPending, CopyStateIcon } =
     useProviderSessionIdCopy(sessionId, providerLabel);
+  const resumeCopy = useTerminalResumeCommandCopy(sessionId, provider, t);
+  const handleOptionsOpenChange = useCallback((open: boolean) => {
+    setOptionsOpen(open);
+    resumeCopy.setOptionsOpen(open);
+  }, [setOptionsOpen, resumeCopy.setOptionsOpen]);
 
   // Read from the backend capability matrix rather than branching on the
   // provider id here; the request is cached module-side, so every row shares one.
@@ -148,7 +154,7 @@ export default function SessionOptions({
           portal
           variant="ghost"
           size="icon"
-          onOpenChange={setOptionsOpen}
+          onOpenChange={handleOptionsOpenChange}
           triggerClassName="h-7 w-7 text-muted-foreground opacity-70 hover:bg-muted hover:opacity-100"
           menuClassName="w-[260px] rounded-xl p-1.5 shadow-xl"
           header={(
@@ -175,6 +181,15 @@ export default function SessionOptions({
               closeOnSelect: false,
               onSelect: handleCopyAction,
             },
+            ...(resumeCopy.isSupported ? [{
+              key: 'copy-resume-command',
+              label: resumeCopy.copyLabel,
+              description: resumeCopy.copyState === 'error' ? 'Click to try again.' : undefined,
+              icon: resumeCopy.CopyStateIcon,
+              loading: resumeCopy.isCopyPending,
+              closeOnSelect: false,
+              onSelect: resumeCopy.handleCopyAction,
+            }] : []),
             ...(canFork && onFork ? [{
               key: 'fork',
               label: 'Fork session',
