@@ -57,6 +57,11 @@ const abortedSessionIds = new Set();
 // (see addSession). Their run loops must stay silent on wind-down: the map
 // entry, the abort flag, and all client-facing events belong to the new run.
 const supersededInstances = new WeakSet();
+// The steering handle of each run whose CLI stdin is still open, keyed like
+// activeSessions. Registered the moment a run starts (before the process is
+// spawned) so a message steered during setup still lands, and removed when the
+// run's stdin closes for good.
+const liveInputs = new Map();
 
 const TOOL_APPROVAL_TIMEOUT_MS = parseInt(process.env.CLAUDE_TOOL_APPROVAL_TIMEOUT_MS, 10) || 55000;
 
@@ -298,7 +303,15 @@ function mapCliOptionsToSDK(options = {}) {
   // In SDK mode the CLI ignores the `showThinkingSummaries` setting, and newer models
   // return empty thinking blocks unless a display is requested. Ask only for the display
   // so the CLI still decides whether thinking runs for the selected model.
-  sdkOptions.extraArgs = { ...(sdkOptions.extraArgs || {}), 'thinking-display': 'summarized' };
+  // `replay-user-messages` makes the CLI echo each user message on stdout at
+  // the moment it takes it in. A message steered into a running turn is only
+  // read at the next tool boundary — or, when none is left, as a turn of its
+  // own right after the `result` — and that echo is the only way to tell which.
+  sdkOptions.extraArgs = {
+    ...(sdkOptions.extraArgs || {}),
+    'thinking-display': 'summarized',
+    'replay-user-messages': null,
+  };
 
   // The SDK resumes with the provider-native session id, never the app id.
   // `resumeFromScratch` is set when the very first prompt of a conversation was
@@ -869,29 +882,87 @@ async function buildPromptMessages(command, images, files, cwd) {
 }
 
 /**
- * Wraps prompt messages in an async iterable that yields them and then parks.
+ * The CLI's stdin for one run: the turn's prompt, then any message steered in
+ * while the process is up, held open in between.
  *
  * The SDK closes the CLI's stdin as soon as its input iterable is exhausted (and
  * immediately on `result` for string prompts). The CLI reads that EOF as the end
  * of the run and kills anything still going in the background, so the iterable
  * has to stay pending until we actually want the process gone.
  *
- * @param {Array<Object>} messages - SDKUserMessage records to send
- * @returns {{ stream: AsyncIterable, release: () => void }} Stream plus its closer
+ * Created before the prompt is built so steering can be accepted from the
+ * moment a run starts: `push` before `start` queues behind the prompt. Each
+ * `stream()` call returns a fresh iterable over the same input, because a query
+ * attempt that fails to start abandons the one it was given.
+ *
+ * @returns {{
+ *   start: (messages: Array<Object>) => void,
+ *   push: (message: Object) => boolean,
+ *   release: () => void,
+ *   isReleased: () => boolean,
+ *   stream: () => AsyncIterable<Object>
+ * }}
  */
-function createHeldPromptStream(messages) {
-  let release;
-  const held = new Promise((resolve) => { release = resolve; });
-
-  const stream = (async function* () {
-    for (const message of messages) {
-      yield message;
+function createPromptInput() {
+  let initialMessages = null;
+  const steered = [];
+  let released = false;
+  const waiters = new Set();
+  const wakeAll = () => {
+    for (const wake of waiters) {
+      wake();
     }
-    // Keeps stdin open — the CLI stays alive until release() is called.
-    await held;
-  })();
+    waiters.clear();
+  };
+  const nextChange = () => new Promise((resolve) => { waiters.add(resolve); });
 
-  return { stream, release };
+  return {
+    start(messages) {
+      initialMessages = messages;
+      wakeAll();
+    },
+    // False once stdin is closed: the process is winding down and nothing
+    // written now would be read.
+    push(message) {
+      if (released) {
+        return false;
+      }
+      steered.push(message);
+      wakeAll();
+      return true;
+    },
+    // Messages not yet handed to the CLI are dropped: a release is an abort or
+    // the end of the run, and neither should start another turn.
+    release() {
+      released = true;
+      steered.length = 0;
+      wakeAll();
+    },
+    isReleased: () => released,
+    stream() {
+      return (async function* () {
+        while (initialMessages === null && !released) {
+          await nextChange();
+        }
+        if (released) {
+          return;
+        }
+        for (const message of initialMessages) {
+          yield message;
+        }
+        // Keeps stdin open — the CLI stays alive until release() is called.
+        for (;;) {
+          while (steered.length > 0) {
+            yield steered.shift();
+          }
+          if (released) {
+            return;
+          }
+          await nextChange();
+        }
+      })();
+    },
+  };
 }
 
 /**
@@ -980,9 +1051,14 @@ async function queryClaudeSDK(command, options = {}, ws, context) {
     });
   };
 
-  // Closes the held stdin stream so the CLI can wind down. Replaced once the
-  // stream exists; the finally block calls it no matter how the run ends.
-  let releasePromptStream = () => {};
+  // The CLI's stdin. Closing it lets the CLI wind down; the finally block does
+  // so no matter how the run ends.
+  const promptInput = createPromptInput();
+  const releasePromptStream = () => promptInput.release();
+  // uuids of steered messages the CLI has not taken in yet (it echoes each one
+  // when it does). While any is outstanding, a `result` does not end the work
+  // the user is watching: the CLI answers the message in a turn of its own.
+  const pendingSteerIds = new Set();
   let idleReleaseTimer = null;
   // The client is told the turn is over as soon as `result` lands, even though
   // the process lingers, so the UI never waits out the idle hold.
@@ -1029,6 +1105,55 @@ async function queryClaudeSDK(command, options = {}, ws, context) {
     // Never let the hold keep the server process alive on its own.
     idleReleaseTimer.unref?.();
   };
+
+  // Steering writes a user message into this run's live stdin. The CLI reads
+  // it at the next tool boundary of the turn in flight; after the turn's
+  // `result` (process held for background work) it starts a new turn in the
+  // same process, leaving that work running.
+  const steerKey = sessionKey();
+  const steerHandle = {
+    async steer(steerCommand, steerOptions = {}, { allowNewTurn = false } = {}) {
+      if (promptInput.isReleased()) {
+        return { delivered: false, newTurn: false };
+      }
+      const messages = await buildPromptMessages(
+        steerCommand,
+        steerOptions.images,
+        steerOptions.files,
+        steerOptions.cwd || options.cwd,
+      );
+      // Re-checked after the attachments were read: the turn may have ended
+      // (and the process been let go) meanwhile.
+      if (promptInput.isReleased() || (turnCompleteSent && !allowNewTurn)) {
+        return { delivered: false, newTurn: false };
+      }
+      const newTurn = turnCompleteSent;
+      for (const message of messages) {
+        message.uuid = crypto.randomUUID();
+        pendingSteerIds.add(message.uuid);
+        promptInput.push(message);
+      }
+      if (newTurn) {
+        // The client was told the last turn ended; this one ends with its own
+        // `complete`. The idle countdown is re-armed rather than cleared so a
+        // CLI that never answers is still let go eventually.
+        turnCompleteSent = false;
+        assistantBudgetSent = false;
+        scheduleRelease();
+      }
+      return { delivered: true, newTurn };
+    },
+    // Called by abort: an interrupt does not drop a message the CLI already
+    // holds, which it would answer as a fresh turn after the abort.
+    discardPendingSteers() {
+      const hadPending = pendingSteerIds.size > 0;
+      pendingSteerIds.clear();
+      return hadPending;
+    },
+  };
+  if (steerKey) {
+    liveInputs.set(steerKey, steerHandle);
+  }
 
   // Hoisted above the try so the catch's cleanup can tell whether this run
   // still owns the activeSessions entry (or was superseded by a newer run).
@@ -1171,11 +1296,10 @@ async function queryClaudeSDK(command, options = {}, ws, context) {
     // The SDK's own `query`, unless the caller supplies one (tests script the
     // stream to drive the hold logic below without a CLI process).
     const createQuery = context.createQuery ?? query;
-    let heldPrompt = createHeldPromptStream(promptMessages);
-    releasePromptStream = heldPrompt.release;
+    promptInput.start(promptMessages);
     try {
       queryInstance = createQuery({
-        prompt: heldPrompt.stream,
+        prompt: promptInput.stream(),
         options: sdkOptions
       });
     } catch (hookError) {
@@ -1183,12 +1307,10 @@ async function queryClaudeSDK(command, options = {}, ws, context) {
       // Keep notification behavior operational via runtime events even if hook registration fails.
       console.warn('Failed to initialize Claude query with hooks, retrying without hooks:', hookError?.message || hookError);
       delete sdkOptions.hooks;
-      // Discard the abandoned stream and build a fresh one for the retry.
-      heldPrompt.release();
-      heldPrompt = createHeldPromptStream(promptMessages);
-      releasePromptStream = heldPrompt.release;
+      // The abandoned attempt's iterable is dropped; the retry reads the same
+      // input (prompt plus anything steered meanwhile) from a fresh one.
       queryInstance = createQuery({
-        prompt: heldPrompt.stream,
+        prompt: promptInput.stream(),
         options: sdkOptions
       });
     }
@@ -1219,6 +1341,16 @@ async function queryClaudeSDK(command, options = {}, ws, context) {
         }
       } else {
         // session_id already captured
+      }
+
+      // The CLI's echo of a user message it has just taken in (see
+      // `replay-user-messages`). The client already shows what the user sent,
+      // so the echo is only bookkeeping: it settles a steered message.
+      if (message.type === 'user' && message.isReplay === true) {
+        if (typeof message.uuid === 'string') {
+          pendingSteerIds.delete(message.uuid);
+        }
+        continue;
       }
 
       // Transform and normalize message via adapter
@@ -1301,12 +1433,20 @@ async function queryClaudeSDK(command, options = {}, ws, context) {
         && message.subtype === 'task_notification'
         && message.status === 'stopped'
         && !backgroundWork.hasOutstanding(sessionKey())
+        // A steered message still on its way is a turn the CLI has yet to run.
+        && pendingSteerIds.size === 0
       ) {
         heldForBackgroundWork = false;
         releasePromptStream();
       }
 
-      if (message.type === 'result') {
+      if (message.type === 'result' && pendingSteerIds.size > 0) {
+        // A steered message reached the CLI after the turn's last tool
+        // boundary. The CLI answers it in a turn of its own straight after this
+        // one, so the work is not over: no `complete`, and stdin stays open.
+        // The idle countdown only guards against a CLI that never answers.
+        scheduleRelease();
+      } else if (message.type === 'result') {
         // The turn is done as far as the client is concerned.
         const abortPending = sessionKey() ? abortedSessionIds.has(sessionKey()) : false;
         const stillOutstanding = backgroundWork.hasOutstanding(sessionKey());
@@ -1445,7 +1585,35 @@ async function queryClaudeSDK(command, options = {}, ws, context) {
       idleReleaseTimer = null;
     }
     releasePromptStream();
+    // A newer run may already own the key; only drop our own handle.
+    if (steerKey && liveInputs.get(steerKey) === steerHandle) {
+      liveInputs.delete(steerKey);
+    }
   }
+}
+
+/**
+ * Delivers a user message into the live CLI process of a session.
+ *
+ * Mid-turn, the CLI reads it at its next tool boundary and the turn changes
+ * course; only that turn's single `complete` is sent. With `allowNewTurn`, a
+ * process held open for background work after its turn ended takes it as a
+ * new turn, and the background work keeps running. Never starts a process.
+ *
+ * @param {string} sessionId - App session id
+ * @param {string} command - The message text
+ * @param {Object} options - `images`, `files` and `cwd`, as for a run
+ * @param {{ allowNewTurn?: boolean }} steerOptions
+ * @returns {Promise<{ delivered: boolean, newTurn: boolean }>} `delivered`
+ *   false when no live stdin could take the message (nothing was sent);
+ *   `newTurn` true when it started a turn after the previous one completed.
+ */
+async function steerClaudeSDKSession(sessionId, command, options = {}, steerOptions = {}) {
+  const handle = liveInputs.get(sessionId);
+  if (!handle) {
+    return { delivered: false, newTurn: false };
+  }
+  return handle.steer(command, options, steerOptions);
 }
 
 /**
@@ -1474,6 +1642,17 @@ async function abortClaudeSDKSession(sessionId) {
     // Release the held stdin stream; without this the CLI stays up for the rest
     // of the post-turn hold even though the user cancelled.
     session.releaseInput?.();
+
+    // A steered message the CLI already holds but has not reached survives
+    // the interrupt: the CLI would answer it as a new turn after the abort.
+    // Ending the process is the only way to take it back.
+    if (liveInputs.get(sessionId)?.discardPendingSteers()) {
+      try {
+        session.instance.close?.();
+      } catch (error) {
+        console.error(`Error closing session ${sessionId} after abort:`, error?.message || error);
+      }
+    }
 
     // Update session status
     session.status = 'aborted';
@@ -1599,6 +1778,7 @@ export const claudeRuntime = {
   },
   listBackgroundWork: listClaudeSDKBackgroundWork,
   stopBackgroundTask: stopClaudeSDKTask,
+  steer: steerClaudeSDKSession,
 };
 
 // Export public API
@@ -1607,6 +1787,7 @@ export {
   abortClaudeSDKSession,
   listClaudeSDKBackgroundWork,
   stopClaudeSDKTask,
+  steerClaudeSDKSession,
   isClaudeSDKSessionActive,
   getClaudeSDKSessionStartTime,
   getActiveClaudeSDKSessions,

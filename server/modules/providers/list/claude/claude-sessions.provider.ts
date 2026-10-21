@@ -974,6 +974,59 @@ const PASTED_CONTENT =
  * message shows the text that was pasted. Unclosed or mismatched-id wrappers are
  * left untouched, and a message with no wrapper is returned unchanged.
  */
+/**
+ * A message the user sent while a turn was running, as the CLI records it: a
+ * `queued_command` attachment at the point the turn read it — the next tool
+ * boundary — rather than a `user` row. Shown as the user's message there. The
+ * CLI files background-task reports the same way (`commandMode`
+ * `task-notification`); those are not the user's words and stay hidden.
+ */
+function normalizeSteeredPrompt(
+  attachment: AnyRecord,
+  id: string,
+  timestamp: string,
+  sessionId: string | null,
+): NormalizedMessage[] {
+  if (attachment.commandMode !== 'prompt') {
+    return [];
+  }
+
+  const prompt = attachment.prompt;
+  let text = '';
+  const images: Array<{ data: string }> = [];
+  if (typeof prompt === 'string') {
+    text = prompt;
+  } else if (Array.isArray(prompt)) {
+    const textParts: string[] = [];
+    for (const part of prompt) {
+      if (part?.type === 'text' && typeof part.text === 'string') {
+        textParts.push(part.text);
+      } else if (part?.type === 'image' && part.source?.type === 'base64' && typeof part.source.data === 'string') {
+        const mediaType = typeof part.source.media_type === 'string' ? part.source.media_type : 'image/png';
+        images.push({ data: `data:${mediaType};base64,${part.source.data}` });
+      }
+    }
+    text = textParts.join('\n');
+  }
+
+  const parsedFiles = parseFilesInputTag(text);
+  if (isInternalContent(parsedFiles.text) || (!parsedFiles.text && parsedFiles.attachments.length === 0 && images.length === 0)) {
+    return [];
+  }
+
+  return [createNormalizedMessage({
+    id,
+    sessionId,
+    timestamp,
+    provider: PROVIDER,
+    kind: 'text',
+    role: 'user',
+    content: parsedFiles.text,
+    images: images.length > 0 ? images : undefined,
+    files: parsedFiles.attachments.length > 0 ? parsedFiles.attachments : undefined,
+  })];
+}
+
 function unwrapPastedContent(text: string): string {
   let unwrapped = false;
   const result = text.replace(PASTED_CONTENT, (_match, _id: string, body: string) => {
@@ -1248,7 +1301,9 @@ export class ClaudeSessionsProvider implements IProviderSessions {
     // A synthesized id is useless as an anchor — it changes on every read — so
     // a row without its own uuid produces messages with no anchor at all.
     const raw = readObjectRecord(rawMessage);
-    const anchorId = typeof raw?.uuid === 'string' && raw.uuid ? raw.uuid : null;
+    // A steered message (an `attachment` row) is not something a turn can be
+    // replayed from: it was read in the middle of one, after a tool result.
+    const anchorId = typeof raw?.uuid === 'string' && raw.uuid && raw.type !== 'attachment' ? raw.uuid : null;
     if (anchorId) {
       for (const message of messages) {
         if (message.role === 'user') {
@@ -1355,6 +1410,10 @@ export class ClaudeSessionsProvider implements IProviderSessions {
       }
 
       return [];
+    }
+
+    if (raw.type === 'attachment' && raw.attachment?.type === 'queued_command') {
+      return normalizeSteeredPrompt(raw.attachment, baseId, ts, sessionId);
     }
 
     if (raw.message?.role === 'user' && raw.message?.content && raw.isMeta !== true) {

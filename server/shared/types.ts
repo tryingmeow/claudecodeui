@@ -631,6 +631,22 @@ export type ProviderRuntimePermissionGateway = {
 };
 
 /**
+ * Outcome of steering a message into a session's live provider process.
+ *
+ * `delivered` is false when no live process could take the message — nothing
+ * was sent, and the caller decides between a normal send and reporting it.
+ * `newTurn` is true when the message started a turn after the previous one had
+ * already reported `complete` (a process held open for background work): the
+ * chat run has to be reopened so that turn's own `complete` is not dropped.
+ * Produced by provider runtimes that support steering (Claude), returned
+ * through the provider runtime service to the chat websocket handler.
+ */
+export type ProviderSteerResult = {
+  delivered: boolean;
+  newTurn: boolean;
+};
+
+/**
  * Provider-scoped application capabilities supplied to a runtime for one run.
  *
  * Keeping these lookups outside concrete SDK/CLI adapters prevents the
@@ -653,6 +669,7 @@ export type ProviderRuntimeContext = {
   createQuery?: (input: { prompt: AsyncIterable<unknown>; options: AnyRecord }) => AsyncIterable<unknown> & {
     interrupt(): Promise<void>;
     stopTask?(taskId: string): Promise<void>;
+    close?(): void;
   };
 };
 

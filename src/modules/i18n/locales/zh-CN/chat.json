@@ -132,7 +132,10 @@
       "ctrlEnter": "Ctrl+Enter 发送 • Shift+Enter 换行 • Tab 切换模式 • / 斜杠命令",
       "enter": "Enter 发送 • Shift+Enter 换行 • Tab 切换模式 • / 斜杠命令",
       "queue": "Enter 排队发送下一条消息",
-      "updateQueued": "Enter 更新排队消息"
+      "updateQueued": "Enter 更新排队消息",
+      "steer": "Enter 立即发送，Claude 会在下一步读到 • Alt+Enter 排队到本轮结束后",
+      "steerCtrl": "Ctrl+Enter 立即发送，Claude 会在下一步读到 • Alt+Enter 排队到本轮结束后",
+      "steerBackground": "Enter 立即发送，后台任务继续运行 • Alt+Enter 排队到它们结束后"
     },
     "clickToChangeMode": "点击更改权限模式（或在输入框中按 Tab）",
     "showAllCommands": "显示所有命令",
@@ -144,7 +147,9 @@
       "label": "已排队",
       "willSend": "将在当前完成后发送",
       "edit": "编辑排队消息",
-      "delete": "删除排队消息"
+      "delete": "删除排队消息",
+      "steer": "立即发送",
+      "queueInstead": "排队到结束后再发"
     }
   },
   "providerSelection": {

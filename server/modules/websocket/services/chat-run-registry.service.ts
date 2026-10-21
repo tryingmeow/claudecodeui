@@ -233,6 +233,28 @@ export const chatRunRegistry = {
     return run;
   },
 
+  /**
+   * Marks a completed run as running again, for a turn steered into the same
+   * provider process after it reported `complete` (held open for background
+   * work). The run keeps its writer, event log and `seq` — the process is the
+   * same one — so the new turn's own `complete` passes the exactly-one check
+   * and closes it again. `connection` joins the live audience. Returns false
+   * when there is no completed run to reopen.
+   */
+  reopenRun(appSessionId: string, connection: RealtimeClientConnection | null): boolean {
+    const run = runs.get(appSessionId);
+    if (!run || run.status !== 'completed') {
+      return false;
+    }
+
+    run.status = 'running';
+    run.completedAt = null;
+    if (connection) {
+      run.writer.updateWebSocket(connection);
+    }
+    return true;
+  },
+
   getRun(appSessionId: string): ChatRun | undefined {
     return runs.get(appSessionId);
   },

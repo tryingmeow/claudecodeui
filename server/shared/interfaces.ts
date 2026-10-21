@@ -17,6 +17,7 @@ import type {
   ProviderRuntimeContext,
   ProviderRuntimePermissionGateway,
   ProviderRuntimeWriter,
+  ProviderSteerResult,
   UpsertProviderMcpServerInput,
   WorkflowAgentActivity,
 } from '@/shared/types.js';
@@ -51,6 +52,18 @@ export interface IProviderRuntime {
    * settled, or the id was never one of its own.
    */
   stopBackgroundTask?(sessionId: string, taskId: string): Promise<boolean>;
+  /**
+   * Writes a user message into the session's live process: into the turn in
+   * flight, or — with `allowNewTurn` — as a new turn of a process held open
+   * for background work, without stopping that work. Never starts a process.
+   * Only runtimes whose process reads input mid-turn implement it.
+   */
+  steer?(
+    sessionId: string,
+    command: string,
+    options: AnyRecord,
+    steerOptions: { allowNewTurn: boolean },
+  ): Promise<ProviderSteerResult>;
 }
 
 /**

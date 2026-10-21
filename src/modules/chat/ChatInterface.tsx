@@ -214,6 +214,8 @@ function ChatInterface({
     isDragActive,
     openAttachmentPicker,
     handleSubmit,
+    handleQueueSubmit,
+    canSteer,
     backgroundSendPrompt,
     resolveBackgroundSendPrompt,
     queuedDraft,
@@ -563,6 +565,8 @@ function ChatInterface({
           hasInput={Boolean(input.trim())}
           onClearInput={handleClearInput}
           onSubmit={handleSubmit}
+          canSteer={canSteer}
+          onQueueSubmit={handleQueueSubmit}
           isDragActive={isDragActive}
           queuedDraft={queuedDraft}
           backgroundSendPrompt={backgroundSendPrompt}

@@ -16,6 +16,11 @@ import type { BackgroundSendChoice, PermissionMode, Project, ProjectSession, Ses
  * composer says so and asks before sending: send anyway, queue the message
  * until the work finishes (the server holds it while the work runs), or
  * cancel.
+ *
+ * Claude is the exception: its new turn goes into the process the work runs
+ * under (`chat.steer`), which leaves the work running, so it sends without
+ * asking; Alt+Enter or the queue button still queues behind the work. The
+ * dialog cases therefore use a provider that cannot steer.
  */
 
 const { writeQueuedMessage } = vi.hoisted(() => ({ writeQueuedMessage: vi.fn() }));
@@ -52,32 +57,37 @@ const backgroundOnly: SessionActivityMap = new Map([[
 
 const uploads = () => vi.mocked(fetch).mock.calls.filter(([url]) => String(url).includes('/api/assets/files'));
 
-const render = (processingSessions: SessionActivityMap) => {
-  const sent: Array<{ type: string }> = [];
+const render = (
+  processingSessions: SessionActivityMap,
+  { provider = 'codex', isLoading = false }: { provider?: 'claude' | 'codex'; isLoading?: boolean } = {},
+) => {
+  const sent: Array<{ type: string; content?: string; options?: Record<string, unknown> }> = [];
+  const added: Array<{ type: string; content?: string }> = [];
   const view = renderHook(() =>
     useChatComposerState({
       selectedProject: PROJECT,
       selectedSession: SESSION,
       currentSessionId: SESSION.id,
-      provider: 'claude',
+      provider,
       permissionMode: 'default',
       cyclePermissionMode: () => undefined,
       resolvePermissionModeForProvider: () => 'default' as PermissionMode,
       currentProviderModel: 'test-model',
       currentProviderEffort: 'medium',
-      isLoading: false,
+      isLoading,
       processingSessions,
       canAbortSession: false,
       tokenBudget: null,
       sendMessage: (message) => { sent.push(message as { type: string }); },
       scrollToBottom: () => undefined,
-      addMessage: () => undefined,
+      addMessage: (message) => { added.push(message as { type: string; content?: string }); },
       setIsUserScrolledUp: () => undefined,
       setPendingPermissionRequests: () => undefined,
     }),
   );
   const sends = () => sent.filter((message) => message.type === 'chat.send');
-  return { view, sends };
+  const steers = () => sent.filter((message) => message.type === 'chat.steer');
+  return { view, sends, steers, added };
 };
 
 type View = ReturnType<typeof render>['view'];
@@ -211,4 +221,64 @@ test('a session with nothing in the background sends without asking', async () =
 
   assert.equal(view.result.current.backgroundSendPrompt, null);
   assert.equal(sends().length, 1);
+});
+
+test('claude sends over background work without asking, into the process the work runs under', async () => {
+  const { view, sends, steers } = render(backgroundOnly, { provider: 'claude' });
+  await act(async () => { view.result.current.setInput('hello'); });
+  await act(async () => { await view.result.current.handleSubmit({ preventDefault: () => undefined } as never); });
+
+  assert.equal(view.result.current.backgroundSendPrompt, null);
+  assert.equal(sends().length, 0);
+  assert.equal(steers().length, 1);
+  assert.equal(steers()[0]?.content, 'hello');
+  assert.equal(writeQueuedMessage.mock.calls.length, 0);
+});
+
+test('claude still queues behind background work when asked to', async () => {
+  const { view, sends, steers } = render(backgroundOnly, { provider: 'claude' });
+  await act(async () => { view.result.current.setInput('later'); });
+  await act(async () => { await view.result.current.handleQueueSubmit({ preventDefault: () => undefined } as never); });
+
+  assert.equal(view.result.current.backgroundSendPrompt, null);
+  assert.equal(sends().length + steers().length, 0);
+  assert.equal(readQueuedMessage('session-1')?.content, 'later');
+  assert.equal(view.result.current.queuedDraft?.content, 'later');
+});
+
+test('claude steers a message sent mid-turn, with its uploaded files, and shows it right away', async () => {
+  const { view, steers, added } = render(new Map(), { provider: 'claude', isLoading: true });
+  await act(async () => {
+    view.result.current.setInput('change of plan');
+    view.result.current.setAttachedFiles([new File(['notes'], 'notes.txt', { type: 'text/plain' })]);
+  });
+  await act(async () => { await view.result.current.handleSubmit({ preventDefault: () => undefined } as never); });
+
+  assert.equal(steers().length, 1);
+  assert.equal(steers()[0]?.content, 'change of plan');
+  assert.deepEqual(steers()[0]?.options?.attachments, [UPLOADED]);
+  assert.equal(writeQueuedMessage.mock.calls.length, 0, 'not queued');
+  assert.equal(view.result.current.queuedDraft, null);
+  assert.equal(added.at(-1)?.content, 'change of plan', 'the transcript shows it where it was sent');
+  assert.equal(view.result.current.input, '');
+});
+
+test('the queue option mid-turn holds the message until the turn ends', async () => {
+  const { view, steers } = render(new Map(), { provider: 'claude', isLoading: true });
+  await act(async () => { view.result.current.setInput('after this'); });
+  await act(async () => { await view.result.current.handleQueueSubmit({ preventDefault: () => undefined } as never); });
+
+  assert.equal(steers().length, 0);
+  assert.equal(view.result.current.queuedDraft?.content, 'after this');
+});
+
+test('a slash command mid-turn is queued, not steered', async () => {
+  const { view, steers } = render(new Map(), { provider: 'claude', isLoading: true });
+  await act(async () => { view.result.current.setInput('/compact'); });
+  await act(async () => {
+    await view.result.current.handleSubmit({ preventDefault: () => undefined } as never, undefined, { skipCommandInterception: true });
+  });
+
+  assert.equal(steers().length, 0);
+  assert.equal(view.result.current.queuedDraft?.content, '/compact');
 });

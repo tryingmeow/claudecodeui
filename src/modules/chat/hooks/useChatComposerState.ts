@@ -96,7 +96,22 @@ type SubmitOptions = {
    * run that command instead of being sent.
    */
   skipCommandInterception?: boolean;
+  /**
+   * Hold the message until the session's running turn (or background work)
+   * ends instead of steering it into the live process now. The secondary
+   * choice — Alt+Enter or the composer's queue button — where steering is the
+   * default.
+   */
+  queue?: boolean;
 };
+
+/**
+ * Providers whose live process takes a user message mid-turn. For these,
+ * sending while a turn runs steers it (`chat.steer`) rather than queueing, and
+ * sending over background work starts a turn in the same process instead of
+ * stopping that work.
+ */
+const STEERABLE_PROVIDERS: ReadonlySet<LLMProvider> = new Set<LLMProvider>(['claude']);
 
 const createFakeSubmitEvent = () => {
   return { preventDefault: () => undefined } as unknown as FormEvent<HTMLFormElement>;
@@ -711,6 +726,22 @@ export function useChatComposerState({
     backgroundSendResolverRef.current = null;
   }, []);
 
+  // Empties the composer after its content went out (sent, steered or queued).
+  const clearComposer = useCallback(() => {
+    setInput('');
+    inputValueRef.current = '';
+    setAttachedFiles([]);
+    setFileErrors(new Map());
+    resetCommandMenuState();
+    setIsTextareaExpanded(false);
+    if (textareaRef.current) {
+      textareaRef.current.style.height = 'auto';
+    }
+    if (draftScopeRef.current) {
+      writeDraftText(draftScopeRef.current, '');
+    }
+  }, [resetCommandMenuState, setInput]);
+
   // Persist a message to send "when this finishes" and show it as the queued
   // card. Used while a turn is in flight and when the user chooses to queue
   // behind background work. Attachments must already be uploaded.
@@ -740,20 +771,9 @@ export function useChatComposerState({
 
       queuedDraftSessionRef.current = queuedSessionKey;
       setQueuedDraft(durableDraft);
-      setInput('');
-      inputValueRef.current = '';
-      setAttachedFiles([]);
-      setFileErrors(new Map());
-      resetCommandMenuState();
-      setIsTextareaExpanded(false);
-      if (textareaRef.current) {
-        textareaRef.current.style.height = 'auto';
-      }
-      if (draftScopeRef.current) {
-        writeDraftText(draftScopeRef.current, '');
-      }
+      clearComposer();
     },
-    [recordSentMessage, resetCommandMenuState, setInput],
+    [clearComposer, recordSentMessage],
   );
 
   const submitMessage = useCallback(
@@ -777,9 +797,14 @@ export function useChatComposerState({
         return;
       }
 
-      // A turn is already in flight: stash this message instead of sending it.
-      // Upload attached files now so the queued record contains durable image
-      // descriptors that can be sent even if another session is open later.
+      const canSteer = STEERABLE_PROVIDERS.has(provider);
+
+      // A turn is already in flight. Steer it — write the message into the
+      // live process, which reads it at its next step — or, when the user
+      // asked to wait (or the provider cannot take input mid-turn), stash it
+      // until the turn ends. Upload attached files first either way, so the
+      // message carries durable descriptors; a queued one may be sent even
+      // when another session is open later.
       if (isLoading) {
         // A run can restart in the tiny gap between scheduling and flushing a
         // queued submission. Put the same durable draft back without uploading
@@ -803,6 +828,42 @@ export function useChatComposerState({
             content: `Failed to upload files: ${message}`,
             timestamp: new Date(),
           });
+          return;
+        }
+
+        // Slash commands and edits of an earlier message are not something a
+        // running turn can take in; they keep waiting for it to end.
+        const shouldSteer = canSteer
+          && !submitOptions?.queue
+          && !editingAnchorId
+          && Boolean(queuedSessionKey)
+          && !currentInput.trimStart().startsWith('/');
+        if (shouldSteer && queuedSessionKey) {
+          const attachmentRecords = uploadedAttachments as ChatAttachment[];
+          addMessage({
+            type: 'user',
+            content: currentInput,
+            images: attachmentRecords.filter(isImageAttachment),
+            files: attachmentRecords.filter((attachment) => !isImageAttachment(attachment)),
+            timestamp: new Date(),
+          });
+          // No activity fields: the turn in flight keeps its clock and status
+          // line. Only covers the turn having ended during the upload, when
+          // the server sends the message as a new turn instead.
+          onSessionProcessing?.(queuedSessionKey);
+          setIsUserScrolledUp(false);
+          setTimeout(() => scrollToBottom(), 100);
+          sendMessage({
+            type: 'chat.steer',
+            sessionId: queuedSessionKey,
+            content: currentInput,
+            options: {
+              ...queuedOptions,
+              attachments: uploadedAttachments,
+            },
+          });
+          recordSentMessage(currentInput, queuedSessionKey);
+          clearComposer();
           return;
         }
 
@@ -931,8 +992,27 @@ export function useChatComposerState({
       // stopped, or finish where nothing is listening. Sending is the user's
       // call, but not one to make for them — and queueing behind the work,
       // which the server holds until it finishes, is the safe alternative.
+      //
+      // A provider that steers is different: the message becomes a new turn of
+      // the process the work runs under, which leaves the work running. Only
+      // replacing an earlier message still starts a new process there.
       const backgroundActivity = processingSessionsRef.current?.get(targetSessionId);
-      if (backgroundActivity?.background) {
+      const steerOverBackgroundWork = Boolean(backgroundActivity?.background) && canSteer && !editingAnchorId;
+      if (backgroundActivity?.background && submitOptions?.queue) {
+        if (queuedSubmission) {
+          queuedDraftSessionRef.current = sessionKey;
+          setQueuedDraft(queuedSubmission);
+          return;
+        }
+        queueMessage({
+          content: currentInput,
+          attachments: currentAttachments,
+          uploadedAttachments,
+          options: buildSendOptions(currentInput),
+        }, targetSessionId);
+        return;
+      }
+      if (backgroundActivity?.background && !steerOverBackgroundWork) {
         const work = ownBackgroundTasks(backgroundActivity.tasks ?? [])
           .map((task) => describeBackgroundTask(task, t));
         const choice = await askBeforeSendingOverBackgroundWork(work);
@@ -988,7 +1068,9 @@ export function useChatComposerState({
         // Replacing an already-sent message is its own frame: it changes the
         // shape of the conversation, so it gets validated separately and can
         // report why it was refused.
-        type: editingAnchorId ? 'chat.edit-send' : 'chat.send',
+        type: editingAnchorId
+          ? 'chat.edit-send'
+          : steerOverBackgroundWork ? 'chat.steer' : 'chat.send',
         sessionId: targetSessionId,
         ...(editingAnchorId ? { anchorId: editingAnchorId } : {}),
         content: messageContent,
@@ -1004,26 +1086,14 @@ export function useChatComposerState({
       // navigated to. Queued drafts were recorded when they were queued; the
       // consecutive-duplicate check keeps this second call a no-op.
       recordSentMessage(currentInput, targetSessionId);
-      setInput('');
-      inputValueRef.current = '';
-      resetCommandMenuState();
-      setAttachedFiles([]);
-      setFileErrors(new Map());
-      setIsTextareaExpanded(false);
-
-      if (textareaRef.current) {
-        textareaRef.current.style.height = 'auto';
-      }
-
-      if (draftScopeRef.current) {
-        writeDraftText(draftScopeRef.current, '');
-      }
+      clearComposer();
     },
     [
       selectedSession,
       askBeforeSendingOverBackgroundWork,
       attachedFiles,
       buildSendOptions,
+      clearComposer,
       currentSessionId,
       editingAnchorId,
       executeCommand,
@@ -1077,6 +1147,12 @@ export function useChatComposerState({
   useEffect(() => {
     handleSubmitRef.current = handleSubmit;
   }, [handleSubmit]);
+
+  // The composer's queue button: the click counterpart of Alt+Enter.
+  const handleQueueSubmit = useCallback(
+    (event: MouseEvent | TouchEvent) => handleSubmit(event, undefined, { queue: true }),
+    [handleSubmit],
+  );
 
   // The VPS dispatcher owns sending. While the card is visible, periodically
   // reconcile only its removal so the UI notices when the server claims it.
@@ -1263,6 +1339,18 @@ export function useChatComposerState({
           return;
         }
 
+        // Alt+Enter is the queue option: hold the message until the running
+        // turn (or background work) ends instead of steering it in now.
+        if (
+          event.altKey && !event.shiftKey && !event.ctrlKey && !event.metaKey
+          && STEERABLE_PROVIDERS.has(provider)
+          && (isLoading || processingSessionsRef.current?.get(sessionKeyRef.current ?? '')?.background)
+        ) {
+          event.preventDefault();
+          handleSubmit(event, undefined, { queue: true });
+          return;
+        }
+
         if ((event.ctrlKey || event.metaKey) && !event.shiftKey) {
           event.preventDefault();
           handleSubmit(event);
@@ -1278,6 +1366,8 @@ export function useChatComposerState({
       handleFileMentionsKeyDown,
       handleHistoryKeyDown,
       handleSubmit,
+      isLoading,
+      provider,
       sendByCtrlEnter,
       showCommandMenu,
       showFileDropdown,
@@ -1425,6 +1515,8 @@ export function useChatComposerState({
     isDragActive,
     openAttachmentPicker: open,
     handleSubmit,
+    handleQueueSubmit,
+    canSteer: STEERABLE_PROVIDERS.has(provider),
     backgroundSendPrompt,
     resolveBackgroundSendPrompt,
     queuedDraft,

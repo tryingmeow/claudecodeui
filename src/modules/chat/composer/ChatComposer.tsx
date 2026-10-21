@@ -10,7 +10,7 @@ import type {
   RefObject,
   TouchEvent,
 } from 'react';
-import { PaperclipIcon, MessageSquareIcon, XIcon, Loader2, ArrowUpIcon, PencilIcon } from 'lucide-react';
+import { PaperclipIcon, MessageSquareIcon, XIcon, Loader2, ArrowUpIcon, PencilIcon, ListEndIcon } from 'lucide-react';
 
 import { useVoiceInput } from '@/modules/chat/hooks/useVoiceInput';
 import { useVoiceAvailable } from '@/modules/chat/hooks/useVoiceAvailable';
@@ -71,6 +71,12 @@ type ChatComposerProps = {
   hasInput: boolean;
   onClearInput: () => void;
   onSubmit: (event: FormEvent<HTMLFormElement> | MouseEvent<HTMLButtonElement> | TouchEvent<HTMLButtonElement>) => void;
+  /**
+   * The provider's live process takes messages mid-turn: sending while it is
+   * busy steers it, and `onQueueSubmit` is the secondary "wait until it ends".
+   */
+  canSteer: boolean;
+  onQueueSubmit: (event: MouseEvent<HTMLButtonElement>) => void;
   isDragActive: boolean;
   queuedDraft: QueuedDraft | null;
   backgroundSendPrompt: BackgroundSendPrompt | null;
@@ -148,6 +154,8 @@ export default function ChatComposer({
   hasInput,
   onClearInput,
   onSubmit,
+  canSteer,
+  onQueueSubmit,
   isDragActive,
   queuedDraft,
   backgroundSendPrompt,
@@ -257,21 +265,44 @@ export default function ChatComposer({
   const hasActivityIndicator = Boolean(activity && !hasPendingPermissions);
 
   const hasQueuedDraft = Boolean(queuedDraft);
-  const canQueueDraft = isLoading && Boolean(input.trim() || attachedFiles.length > 0);
-  const submitHint = canQueueDraft
-    ? hasQueuedDraft
-      ? t('input.hintText.updateQueued', { defaultValue: 'Enter to update queued message' })
-      : t('input.hintText.queue', { defaultValue: 'Enter to queue your next message' })
-    : sendByCtrlEnter
-      ? t('input.hintText.ctrlEnter')
-      : t('input.hintText.enter');
-  const submitAriaLabel = canQueueDraft
-    ? hasQueuedDraft
-      ? t('input.queue.update', { defaultValue: 'Update queued message' })
-      : t('input.queue.sendNext', { defaultValue: 'Queue next message' })
-    : isLoading
-      ? t('input.stop')
-      : t('input.send');
+  const hasDraftContent = Boolean(input.trim() || attachedFiles.length > 0);
+  const canQueueDraft = isLoading && hasDraftContent;
+  // Sending now goes into the live process: mid-turn, or over background work
+  // that keeps running. Slash commands are never steered (they still queue).
+  const isBusyForSteer = isLoading || Boolean(activity?.background);
+  const willSteer = canSteer && isBusyForSteer && hasDraftContent && !input.trimStart().startsWith('/');
+  const steerHint = sendByCtrlEnter
+    ? t('input.hintText.steerCtrl', {
+        defaultValue: 'Ctrl+Enter to send now — Claude reads it at its next step • Alt+Enter to queue until it finishes',
+      })
+    : t('input.hintText.steer', {
+        defaultValue: 'Enter to send now — Claude reads it at its next step • Alt+Enter to queue until it finishes',
+      });
+  const submitHint = willSteer
+    ? isLoading
+      ? steerHint
+      : t('input.hintText.steerBackground', {
+          defaultValue: 'Enter to send now — background tasks keep running • Alt+Enter to queue until they finish',
+        })
+    : canQueueDraft
+      ? hasQueuedDraft
+        ? t('input.hintText.updateQueued', { defaultValue: 'Enter to update queued message' })
+        : t('input.hintText.queue', { defaultValue: 'Enter to queue your next message' })
+      : sendByCtrlEnter
+        ? t('input.hintText.ctrlEnter')
+        : t('input.hintText.enter');
+  const submitAriaLabel = willSteer
+    ? t('input.queue.steer', { defaultValue: 'Send now' })
+    : canQueueDraft
+      ? hasQueuedDraft
+        ? t('input.queue.update', { defaultValue: 'Update queued message' })
+        : t('input.queue.sendNext', { defaultValue: 'Queue next message' })
+      : isLoading
+        ? t('input.stop')
+        : t('input.send');
+  const queueInsteadLabel = hasQueuedDraft
+    ? t('input.queue.update', { defaultValue: 'Update queued message' })
+    : t('input.queue.queueInstead', { defaultValue: 'Queue until it finishes' });
 
   return (
     <div className="chat-composer-shell relative flex-shrink-0 px-2 pb-2 pt-0 sm:px-4 sm:pb-4 md:px-4 md:pb-6">
@@ -505,6 +536,16 @@ export default function ChatComposer({
               providerLabel={providerLabel}
             />
 
+            {willSteer && (
+              <PromptInputButton
+                tooltip={{ content: queueInsteadLabel, shortcut: 'Alt+Enter' }}
+                onClick={onQueueSubmit}
+                aria-label={queueInsteadLabel}
+              >
+                <ListEndIcon />
+              </PromptInputButton>
+            )}
+
             <PromptInputSubmit
               onClick={
                 canQueueDraft
@@ -544,7 +585,7 @@ export default function ChatComposer({
 
           <div
             className={`order-last hidden basis-full px-2 text-center text-xs leading-4 text-muted-foreground/50 transition-opacity duration-200 lg:block ${
-              input.trim() && !canQueueDraft ? 'opacity-0' : 'opacity-100'
+              input.trim() && !canQueueDraft && !willSteer ? 'opacity-0' : 'opacity-100'
             }`}
           >
             {submitHint}

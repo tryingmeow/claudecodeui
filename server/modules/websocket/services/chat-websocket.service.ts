@@ -18,6 +18,7 @@ import type {
   LLMProvider,
   ProviderPermissionDecision,
   ProviderRuntimeWriter,
+  ProviderSteerResult,
 } from '@/shared/types.js';
 import { parseIncomingJsonObject } from '@/shared/utils.js';
 
@@ -74,6 +75,14 @@ export type ProviderRuntimeGateway = {
   ): Promise<unknown>;
   abort(provider: LLMProvider, sessionId: string): Promise<boolean>;
   stopBackgroundTask(provider: LLMProvider, sessionId: string, taskId: string): Promise<boolean>;
+  /** Writes a message into the session's live provider process; see `IProviderRuntime.steer`. */
+  steer(
+    provider: LLMProvider,
+    sessionId: string,
+    command: string,
+    options: AnyRecord,
+    steerOptions: { allowNewTurn: boolean },
+  ): Promise<ProviderSteerResult>;
   /** Whether a provider runtime still holds background work for the session after its turn ended. */
   hasBackgroundWork(sessionId: string): boolean;
   resolveToolApproval(requestId: string, payload: ProviderPermissionDecision): void;
@@ -203,6 +212,103 @@ function resolveSendTarget(
 }
 
 /**
+ * The options a provider runtime receives for a message: the client's options
+ * with attachments re-validated server-side — only direct children of the
+ * global upload store may reach provider runtimes or their file tools — and
+ * the session's id and working directory taken from its row.
+ */
+function buildRuntimeOptions(
+  sessionId: string,
+  session: NonNullable<ReturnType<typeof sessionsDb.getSessionById>>,
+  clientOptions: AnyRecord,
+  extraRuntimeOptions: AnyRecord = {},
+): AnyRecord {
+  const attachmentCandidates = [
+    ...normalizeAttachmentDescriptors(clientOptions.images),
+    ...normalizeAttachmentDescriptors(clientOptions.files),
+    ...normalizeAttachmentDescriptors(clientOptions.attachments),
+  ];
+  const verifiedAttachments = filterAttachmentsToUploadStore(attachmentCandidates);
+  const uniqueAttachments = verifiedAttachments.filter(
+    (descriptor, index, all) => all.findIndex((candidate) => candidate.path === descriptor.path) === index,
+  );
+
+  return {
+    ...clientOptions,
+    ...extraRuntimeOptions,
+    attachments: uniqueAttachments,
+    images: uniqueAttachments.filter(isImageAttachmentDescriptor),
+    files: uniqueAttachments.filter((descriptor) => !isImageAttachmentDescriptor(descriptor)),
+    sessionId,
+    cwd: clientOptions.cwd ?? session.project_path ?? undefined,
+    projectPath: session.project_path ?? clientOptions.projectPath,
+  };
+}
+
+/**
+ * Handles `chat.steer`: delivers a message into the session's live provider
+ * process instead of waiting for the turn to end.
+ *
+ * Mid-turn, the provider reads it at its next tool boundary and the turn
+ * changes course. After the turn ended but while the process is held open for
+ * background work, it becomes a new turn of that same process — the work keeps
+ * running, where a `chat.send` would start a new process and stop it — and the
+ * run is reopened so the session shows as busy until that turn completes.
+ *
+ * When nothing live is left to steer (the turn ended while the message was on
+ * its way) it is sent as an ordinary turn. A turn still running that cannot
+ * take it (a provider without steering) is reported as `STEER_UNAVAILABLE`;
+ * nothing was sent then.
+ */
+async function handleChatSteer(
+  ws: WebSocket,
+  userId: string | number | null,
+  data: AnyRecord,
+  dependencies: ChatWebSocketDependencies
+): Promise<void> {
+  const resolved = resolveSendTarget(ws, data, dependencies, 'chat.steer');
+  if (!resolved) {
+    return;
+  }
+  const { sessionId, session, provider } = resolved;
+
+  const run = chatRunRegistry.getRun(sessionId);
+  const midTurn = run?.status === 'running';
+  const overBackgroundWork = run?.status === 'completed' && dependencies.runtime.hasBackgroundWork(sessionId);
+  if (!midTurn && !overBackgroundWork) {
+    await dispatchRun(ws, userId, sessionId, session, data, dependencies);
+    return;
+  }
+
+  const command = typeof data.content === 'string' ? data.content : '';
+  const runtimeOptions = buildRuntimeOptions(sessionId, session, (data.options ?? {}) as AnyRecord);
+  const outcome = await dependencies.runtime.steer(provider, sessionId, command, runtimeOptions, {
+    allowNewTurn: overBackgroundWork,
+  });
+
+  if (outcome.delivered) {
+    // Reopened in the same tick the message was written: the provider's
+    // answer arrives as I/O, after this, so its `complete` finds the run open.
+    if (outcome.newTurn) {
+      chatRunRegistry.reopenRun(sessionId, ws);
+    }
+    return;
+  }
+
+  if (!chatRunRegistry.isProcessing(sessionId)) {
+    await dispatchRun(ws, userId, sessionId, session, data, dependencies);
+    return;
+  }
+
+  sendProtocolError(
+    ws,
+    'STEER_UNAVAILABLE',
+    'The running turn could not take the message, so it was not sent. Send it again when the turn ends.',
+    sessionId,
+  );
+}
+
+/**
  * Registers the run and hands the turn to the provider runtime.
  *
  * `extraRuntimeOptions` is how an edited message asks the provider to resume
@@ -253,34 +359,13 @@ async function dispatchRun(
     providerModelsService.setSessionEffort(provider, sessionId, clientOptions.effort);
   }
 
-  const attachmentCandidates = [
-    ...normalizeAttachmentDescriptors(clientOptions.images),
-    ...normalizeAttachmentDescriptors(clientOptions.files),
-    ...normalizeAttachmentDescriptors(clientOptions.attachments),
-  ];
-  const verifiedAttachments = filterAttachmentsToUploadStore(attachmentCandidates);
-  const uniqueAttachments = verifiedAttachments.filter(
-    (descriptor, index, all) => all.findIndex((candidate) => candidate.path === descriptor.path) === index,
-  );
-
   // The provider runtimes receive the stable app session id. When their
   // CLI/SDK needs the provider-native id for resume, they resolve it from the
   // session row themselves (sessionsService.resolveProviderSessionId).
   // Brand-new sessions have no provider id yet, so the runtime starts fresh
   // and announces one, which the gateway writer captures and maps back to the
   // app session id.
-  const runtimeOptions: AnyRecord = {
-    ...clientOptions,
-    ...extraRuntimeOptions,
-    // Attachments are re-validated server-side: only direct children of the
-    // global upload store may reach provider runtimes or their file tools.
-    attachments: uniqueAttachments,
-    images: uniqueAttachments.filter(isImageAttachmentDescriptor),
-    files: uniqueAttachments.filter((descriptor) => !isImageAttachmentDescriptor(descriptor)),
-    sessionId,
-    cwd: clientOptions.cwd ?? session.project_path ?? undefined,
-    projectPath: session.project_path ?? clientOptions.projectPath,
-  };
+  const runtimeOptions = buildRuntimeOptions(sessionId, session, clientOptions, extraRuntimeOptions);
 
   let failure: string | null = null;
   try {
@@ -579,6 +664,7 @@ function handlePermissionResponse(data: AnyRecord, dependencies: ChatWebSocketDe
  *
  * Inbound protocol (client to server):
  * - `chat.send`                { sessionId, content, options? }
+ * - `chat.steer`               { sessionId, content, options? }
  * - `chat.abort`               { sessionId }
  * - `chat.stop-task`           { sessionId, taskId }
  * - `chat.subscribe`           { sessions: [{ sessionId, lastSeq? }] }
@@ -680,6 +766,9 @@ export function handleChatConnection(
           return;
         case 'chat.send':
           await handleChatSend(ws, userId, data, dependencies);
+          return;
+        case 'chat.steer':
+          await handleChatSteer(ws, userId, data, dependencies);
           return;
         case 'chat.abort':
           await handleChatAbort(ws, data, dependencies);
