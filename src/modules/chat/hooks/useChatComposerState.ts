@@ -1249,11 +1249,23 @@ export function useChatComposerState({
       queuedDraft
       && (queuedDraft.content.trim() || (queuedDraft.uploadedAttachments?.length ?? 0) > 0)
     ) {
-      writeQueuedMessage(sessionKey, {
+      const next = {
         content: queuedDraft.content,
         options: queuedDraft.options,
         attachments: queuedDraft.uploadedAttachments,
-      });
+      };
+      // A draft restored from storage (session switch, reload) is already
+      // stored. Writing it back would re-send a copy the server may have
+      // claimed and sent since, and the dispatcher would send it again.
+      const stored = readQueuedMessage(sessionKey);
+      if (
+        stored
+        && JSON.stringify({ content: stored.content, options: stored.options, attachments: stored.attachments })
+          === JSON.stringify(next)
+      ) {
+        return;
+      }
+      writeQueuedMessage(sessionKey, next);
     } else {
       clearQueuedMessage(sessionKey);
     }

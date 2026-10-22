@@ -26,7 +26,7 @@ type UserDependencies = {
   };
   drafts: {
     getDrafts(userId: number): DraftRecord[];
-    saveDraft(userId: number, scope: string, draft: { text: string; queuedMessage: unknown | null }): void;
+    saveDraft(userId: number, scope: string, draft: { text: string; queuedMessage?: unknown | null }): void;
     deleteDraft(userId: number, scope: string): void;
   };
   readSystemGitConfig(): Promise<GitConfig>;
@@ -175,10 +175,15 @@ export function createUserService(dependencies: UserDependencies) {
         });
       }
 
-      dependencies.drafts.saveDraft(userId, scope, {
-        text,
-        queuedMessage: payload.queuedMessage ?? null,
-      });
+      // An omitted queued message means "text only": the stored queue is left
+      // as it is, rather than overwritten by the client's possibly stale copy.
+      dependencies.drafts.saveDraft(
+        userId,
+        scope,
+        'queuedMessage' in payload
+          ? { text, queuedMessage: payload.queuedMessage ?? null }
+          : { text },
+      );
       return { success: true };
     },
 
