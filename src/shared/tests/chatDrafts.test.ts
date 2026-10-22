@@ -70,8 +70,21 @@ test('a draft is readable synchronously and reaches the server after the debounc
 
   await vi.advanceTimersByTimeAsync(1_500);
   assert.deepEqual(savedDrafts, [
-    { scope: 'session-a', text: 'half a thought', queuedMessage: null },
+    { scope: 'session-a', text: 'half a thought' },
   ]);
+});
+
+test('typing after a queued message was sent does not upload that message again', async () => {
+  const store = await loadStore();
+  store.writeQueuedMessage('session-a', { content: 'send once' });
+  savedDrafts.length = 0;
+
+  // The server dispatcher has claimed the queue, but this page has not
+  // hydrated yet, so its local copy is stale while the user keeps typing.
+  store.writeDraftText('session-a', 'my next message');
+  await vi.advanceTimersByTimeAsync(1_500);
+
+  assert.deepEqual(savedDrafts, [{ scope: 'session-a', text: 'my next message' }]);
 });
 
 test('each session keeps its own draft', async () => {

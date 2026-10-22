@@ -52,6 +52,12 @@ const listeners = new Set<() => void>();
 
 let drafts = new Map<string, DraftRecord>();
 const pendingScopes = new Set<string>();
+/**
+ * Scopes whose queued message itself changed since the last flush. Only these
+ * send `queuedMessage`: the local copy can be stale once the server dispatcher
+ * has claimed and sent it, and re-sending it with a keystroke re-queues it.
+ */
+const pendingQueueScopes = new Set<string>();
 let serverWriteTimer: ReturnType<typeof setTimeout> | null = null;
 
 const isRecord = (value: unknown): value is Record<string, unknown> => (
@@ -113,7 +119,9 @@ function notifyListeners(): void {
 function flushServerWrites(): void {
   serverWriteTimer = null;
   const scopes = [...pendingScopes];
+  const queueScopes = new Set(pendingQueueScopes);
   pendingScopes.clear();
+  pendingQueueScopes.clear();
 
   for (const scope of scopes) {
     const draft = drafts.get(scope);
@@ -129,10 +137,9 @@ function flushServerWrites(): void {
         continue;
       }
 
-      void api.user.saveDraft(scope, {
-        text: draft.text,
-        queuedMessage: draft.queuedMessage,
-      }).catch((error: unknown) => {
+      void api.user.saveDraft(scope, queueScopes.has(scope)
+        ? { text: draft.text, queuedMessage: draft.queuedMessage }
+        : { text: draft.text }).catch((error: unknown) => {
         console.error('Failed to save chat draft:', error);
       });
     } catch (error) {
@@ -174,6 +181,9 @@ function updateDraft(scope: string, update: Partial<DraftRecord>): void {
   }
   drafts = nextDrafts;
 
+  if (next.queuedMessage !== current.queuedMessage) {
+    pendingQueueScopes.add(scope);
+  }
   writeMirror();
   queueServerWrite(scope);
   notifyListeners();
@@ -287,6 +297,7 @@ export async function hydrateChatDrafts(): Promise<void> {
 export function resetChatDrafts(): void {
   drafts = new Map();
   pendingScopes.clear();
+  pendingQueueScopes.clear();
   if (serverWriteTimer !== null) {
     clearTimeout(serverWriteTimer);
     serverWriteTimer = null;

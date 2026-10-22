@@ -120,6 +120,41 @@ test('saving an empty draft deletes the row rather than keeping a blank one', as
   });
 });
 
+test('a text-only save does not bring back a queued message the dispatcher claimed', async () => {
+  await withDatabase(() => {
+    sessionDraftsDb.saveDraft(USER_ID, 'session-a', {
+      text: '',
+      queuedMessage: { content: 'send once' },
+    });
+    // What claimQueuedMessage does once the dispatcher picks the turn up.
+    getConnection()
+      .prepare('UPDATE session_drafts SET queued_message = NULL WHERE user_id = ? AND draft_scope = ?')
+      .run(USER_ID, 'session-a');
+
+    sessionDraftsDb.saveDraft(USER_ID, 'session-a', { text: 'next message' });
+
+    const [draft] = sessionDraftsDb.getDrafts(USER_ID);
+    assert.equal(draft?.text, 'next message');
+    assert.equal(draft?.queuedMessage, null);
+  });
+});
+
+test('a text-only save keeps a pending queued message, and clearing the text keeps its row', async () => {
+  await withDatabase(() => {
+    sessionDraftsDb.saveDraft(USER_ID, 'session-a', {
+      text: 'typing',
+      queuedMessage: { content: 'still queued' },
+    });
+
+    sessionDraftsDb.saveDraft(USER_ID, 'session-a', { text: '' });
+    assert.deepEqual(sessionDraftsDb.getDrafts(USER_ID)[0]?.queuedMessage, { content: 'still queued' });
+
+    sessionDraftsDb.saveDraft(USER_ID, 'session-b', { text: 'b' });
+    sessionDraftsDb.saveDraft(USER_ID, 'session-b', { text: '' });
+    assert.deepEqual(sessionDraftsDb.getDrafts(USER_ID).map((draft) => draft.scope), ['session-a']);
+  });
+});
+
 test('deleteDraft removes only the named scope', async () => {
   await withDatabase(() => {
     sessionDraftsDb.saveDraft(USER_ID, 'session-a', { text: 'a', queuedMessage: null });
