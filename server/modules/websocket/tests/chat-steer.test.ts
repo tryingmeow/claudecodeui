@@ -9,9 +9,10 @@ import { closeConnection, initializeDatabase, sessionsDb } from '@/modules/datab
 import { handleChatConnection } from '@/modules/websocket/services/chat-websocket.service.js';
 import { chatRunRegistry } from '@/modules/websocket/services/chat-run-registry.service.js';
 import { connectedClients } from '@/modules/websocket/services/websocket-state.service.js';
-import type { ProviderSteerResult } from '@/shared/types.js';
+import type { AnyRecord } from '@/shared/types.js';
 
 const SESSION_ID = 'steer-session';
+const MESSAGE_ID = '0b5c3f8e-6d1a-4c2b-9e7f-1a2b3c4d5e6f';
 
 function createFakeSocket() {
   const socket = new EventEmitter() as EventEmitter & {
@@ -25,19 +26,15 @@ function createFakeSocket() {
   return socket;
 }
 
-type SteerCall = { command: string; options: Record<string, unknown>; allowNewTurn: boolean };
+type SteerCall = { provider: string; sessionId: string; command: string; options: AnyRecord };
 
 /**
- * A gateway whose runtime answers steers with `steerOutcome` and records every
- * steer and every ordinary run it is asked for.
+ * A gateway whose runtime accepts or refuses every steer as `accepts` says.
+ * `running` decides whether the session has a chat run in progress.
  */
 async function withGateway(
-  setup: { steerOutcome: ProviderSteerResult; backgroundWork?: boolean },
-  runTest: (context: {
-    socket: ReturnType<typeof createFakeSocket>;
-    steers: SteerCall[];
-    runs: string[];
-  }) => Promise<void>,
+  { accepts, running }: { accepts: boolean; running: boolean },
+  runTest: (context: { socket: ReturnType<typeof createFakeSocket>; steers: SteerCall[] }) => Promise<void>,
 ): Promise<void> {
   const previousDatabasePath = process.env.DATABASE_PATH;
   const tempDirectory = await mkdtemp(path.join(os.tmpdir(), 'chat-steer-'));
@@ -47,11 +44,19 @@ async function withGateway(
   await initializeDatabase();
 
   const steers: SteerCall[] = [];
-  const runs: string[] = [];
   const socket = createFakeSocket();
 
   try {
     sessionsDb.createAppSession(SESSION_ID, 'claude', tempDirectory);
+    if (running) {
+      chatRunRegistry.startRun({
+        appSessionId: SESSION_ID,
+        provider: 'claude',
+        providerSessionId: null,
+        connection: null,
+        userId: 1,
+      });
+    }
 
     handleChatConnection(
       socket as never,
@@ -59,26 +64,15 @@ async function withGateway(
       {
         runtime: {
           hasRuntime: () => true,
-          hasBackgroundWork: () => Boolean(setup.backgroundWork),
-          steer: async (
-            _provider: string,
-            _sessionId: string,
-            command: string,
-            options: Record<string, unknown>,
-            steerOptions: { allowNewTurn: boolean },
-          ) => {
-            steers.push({ command, options, allowNewTurn: steerOptions.allowNewTurn });
-            return setup.steerOutcome;
-          },
-          run: async (_provider: string, command: string, _options: unknown, writer: { send: (message: unknown) => void }) => {
-            runs.push(command);
-            writer.send({ kind: 'complete', exitCode: 0, provider: 'claude', sessionId: SESSION_ID });
+          steer: async (provider: string, sessionId: string, command: string, options: AnyRecord) => {
+            steers.push({ provider, sessionId, command, options });
+            return accepts;
           },
         } as never,
       },
     );
 
-    await runTest({ socket, steers, runs });
+    await runTest({ socket, steers });
   } finally {
     connectedClients.clear();
     chatRunRegistry.clearAll();
@@ -92,73 +86,74 @@ async function withGateway(
   }
 }
 
+/** The handler is async and the socket listener does not await it. */
 const settle = () => new Promise((resolve) => { setTimeout(resolve, 30); });
 
-function startRunningTurn(): NonNullable<ReturnType<typeof chatRunRegistry.startRun>> {
-  const run = chatRunRegistry.startRun({
-    appSessionId: SESSION_ID,
-    provider: 'claude',
-    providerSessionId: null,
-    connection: null,
-    userId: 1,
-  });
-  assert.ok(run);
-  return run;
-}
-
-test('a steer during a running turn goes into the live process', async () => {
-  await withGateway({ steerOutcome: { delivered: true, newTurn: false } }, async ({ socket, steers, runs }) => {
-    startRunningTurn();
+test('chat.steer hands the message to the session\'s provider runtime', async () => {
+  await withGateway({ accepts: true, running: true }, async ({ socket, steers }) => {
     socket.emit('message', JSON.stringify({
       type: 'chat.steer',
       sessionId: SESSION_ID,
+      messageId: MESSAGE_ID,
       content: 'change course',
-      options: { attachments: [{ path: '/etc/passwd', name: 'passwd' }] },
     }));
     await settle();
 
     assert.equal(steers.length, 1);
+    // The provider comes from the session row, never from the frame.
+    assert.equal(steers[0].provider, 'claude');
+    assert.equal(steers[0].sessionId, SESSION_ID);
     assert.equal(steers[0].command, 'change course');
-    assert.equal(steers[0].allowNewTurn, false);
-    assert.deepEqual(steers[0].options.attachments, [], 'attachments outside the upload store are dropped');
-    assert.deepEqual(runs, []);
-    assert.deepEqual(socket.frames, []);
-    assert.equal(chatRunRegistry.isProcessing(SESSION_ID), true);
+    assert.equal(steers[0].options.messageId, MESSAGE_ID);
+    assert.deepEqual(steers[0].options.images, []);
+    assert.deepEqual(steers[0].options.files, []);
+    // The sender learns it was taken; the echo comes later on the run stream.
+    assert.equal(socket.frames.length, 1);
+    assert.equal(socket.frames[0].kind, 'chat_steer_accepted');
+    assert.equal(socket.frames[0].messageId, MESSAGE_ID);
+    assert.equal(socket.frames[0].sessionId, SESSION_ID);
   });
 });
 
-test('a steer over background work starts a new turn and reopens the run', async () => {
-  await withGateway({ steerOutcome: { delivered: true, newTurn: true }, backgroundWork: true }, async ({ socket, steers }) => {
-    const run = startRunningTurn();
-    run.writer.sendComplete({ exitCode: 0 });
-    assert.equal(chatRunRegistry.isProcessing(SESSION_ID), false);
-
-    socket.emit('message', JSON.stringify({ type: 'chat.steer', sessionId: SESSION_ID, content: 'next question' }));
+test('a steer with no running turn is refused with STEER_UNAVAILABLE, naming the message', async () => {
+  await withGateway({ accepts: true, running: false }, async ({ socket, steers }) => {
+    socket.emit('message', JSON.stringify({ type: 'chat.steer', sessionId: SESSION_ID, messageId: MESSAGE_ID, content: 'hi' }));
     await settle();
 
-    assert.equal(steers[0].allowNewTurn, true);
-    assert.equal(chatRunRegistry.isProcessing(SESSION_ID), true, 'busy until the new turn completes');
-  });
-});
-
-test('a steer with nothing live to steer is sent as an ordinary turn', async () => {
-  await withGateway({ steerOutcome: { delivered: false, newTurn: false } }, async ({ socket, steers, runs }) => {
-    socket.emit('message', JSON.stringify({ type: 'chat.steer', sessionId: SESSION_ID, content: 'hello' }));
-    await settle();
-
-    assert.deepEqual(steers, []);
-    assert.deepEqual(runs, ['hello']);
-  });
-});
-
-test('a running turn that cannot take the steer reports STEER_UNAVAILABLE and sends nothing', async () => {
-  await withGateway({ steerOutcome: { delivered: false, newTurn: false } }, async ({ socket, runs }) => {
-    startRunningTurn();
-    socket.emit('message', JSON.stringify({ type: 'chat.steer', sessionId: SESSION_ID, content: 'hello' }));
-    await settle();
-
-    assert.deepEqual(runs, []);
+    assert.equal(steers.length, 0, 'never reaches the runtime');
     assert.equal(socket.frames.at(-1)?.code, 'STEER_UNAVAILABLE');
-    assert.equal(chatRunRegistry.isProcessing(SESSION_ID), true);
+    assert.equal(socket.frames.at(-1)?.messageId, MESSAGE_ID);
+    assert.equal(socket.frames.at(-1)?.sessionId, SESSION_ID);
+  });
+});
+
+test('a steer the runtime refuses (the turn just ended) is reported the same way', async () => {
+  await withGateway({ accepts: false, running: true }, async ({ socket, steers }) => {
+    socket.emit('message', JSON.stringify({ type: 'chat.steer', sessionId: SESSION_ID, messageId: MESSAGE_ID, content: 'hi' }));
+    await settle();
+
+    assert.equal(steers.length, 1);
+    assert.equal(socket.frames.at(-1)?.code, 'STEER_UNAVAILABLE');
+    assert.equal(socket.frames.at(-1)?.messageId, MESSAGE_ID);
+  });
+});
+
+test('a message id that is not a UUID is replaced, since it becomes the transcript uuid', async () => {
+  await withGateway({ accepts: true, running: true }, async ({ steers, socket }) => {
+    socket.emit('message', JSON.stringify({ type: 'chat.steer', sessionId: SESSION_ID, messageId: '../etc', content: 'hi' }));
+    await settle();
+
+    assert.equal(steers.length, 1);
+    assert.match(String(steers[0].options.messageId), /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
+  });
+});
+
+test('an empty steer is refused before it reaches the runtime', async () => {
+  await withGateway({ accepts: true, running: true }, async ({ socket, steers }) => {
+    socket.emit('message', JSON.stringify({ type: 'chat.steer', sessionId: SESSION_ID, messageId: MESSAGE_ID, content: '   ' }));
+    await settle();
+
+    assert.equal(steers.length, 0);
+    assert.equal(socket.frames.at(-1)?.code, 'MESSAGE_REQUIRED');
   });
 });

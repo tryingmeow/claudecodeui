@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { once } from 'node:events';
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import type { AddressInfo } from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
@@ -13,7 +13,7 @@ import providerRouter from '@/modules/providers/provider.routes.js';
 import { providerRegistry } from '@/modules/providers/provider.registry.js';
 import type { IProvider } from '@/shared/interfaces.js';
 import type { BackgroundTaskSummary, WorkflowAgentActivity } from '@/shared/types.js';
-import { AppError } from '@/shared/utils.js';
+import { AppError, IS_PLATFORM } from '@/shared/utils.js';
 
 async function withProviderServer(
   run: (baseUrl: string, workspacePath: string) => Promise<void>,
@@ -447,6 +447,68 @@ test('the running-sessions route reports a session held open for background work
     });
   } finally {
     providerRegistry.listProviders = realListProviders;
+  }
+});
+
+test('the CLI update route refuses while that provider is busy in a session', {
+  skip: IS_PLATFORM ? 'platform mode refuses every CLI update before the busy check' : false,
+}, async () => {
+  // A session held open for background work counts as busy, like a running
+  // chat: replacing the CLI under it could break the work it is still doing.
+  const realListProviders = providerRegistry.listProviders;
+  providerRegistry.listProviders = () => ['claude', 'codex'].map((id) => ({
+    id,
+    runtime: { listBackgroundWork: () => [{ sessionId: `held-${id}-session`, tasks: [] }] },
+  } as unknown as IProvider));
+
+  // The route runs the real service, so the CLI it would update is a stub that
+  // only logs its calls: if the busy guard ever broke, this test must not run
+  // `claude update` on the developer's own install. PATH holds only the stub's
+  // folder, so a broken guard finds neither a `codex` to update nor `npm`.
+  const cliDirectory = await mkdtemp(path.join(os.tmpdir(), 'provider-routes-cli-'));
+  const callLog = path.join(cliDirectory, 'calls.log');
+  const stubPath = path.join(cliDirectory, process.platform === 'win32' ? 'claude.cmd' : 'claude');
+  await writeFile(callLog, '');
+  await writeFile(
+    stubPath,
+    process.platform === 'win32'
+      ? `@echo off\r\necho %* >> "${callLog}"\r\necho 2.1.200 (Claude Code)\r\n`
+      : `#!/bin/sh\necho "$*" >> "${callLog}"\necho "2.1.200 (Claude Code)"\n`,
+  );
+  await chmod(stubPath, 0o755);
+  const previousCliPath = process.env.CLAUDE_CLI_PATH;
+  const pathKey = Object.keys(process.env).find((key) => key.toLowerCase() === 'path') ?? 'PATH';
+  const previousPath = process.env[pathKey];
+  process.env.CLAUDE_CLI_PATH = stubPath;
+  process.env[pathKey] = cliDirectory;
+
+  try {
+    await withProviderServer(async (baseUrl) => {
+      const busy = await fetch(`${baseUrl}/api/providers/claude/cli/update`, { method: 'POST' });
+      const busyPayload = await busy.json() as { error: { code: string } };
+      assert.equal(busy.status, 409);
+      assert.equal(busyPayload.error.code, 'PROVIDER_CLI_BUSY');
+      assert.equal(await readFile(callLog, 'utf8'), '', 'a refused update never runs the CLI');
+
+      // Codex updates separately from CloudCLI too, so the same guard applies.
+      const codex = await fetch(`${baseUrl}/api/providers/codex/cli/update`, { method: 'POST' });
+      const codexPayload = await codex.json() as { error: { code: string } };
+      assert.equal(codex.status, 409);
+      assert.equal(codexPayload.error.code, 'PROVIDER_CLI_BUSY');
+    });
+  } finally {
+    providerRegistry.listProviders = realListProviders;
+    if (previousPath === undefined) {
+      delete process.env[pathKey];
+    } else {
+      process.env[pathKey] = previousPath;
+    }
+    if (previousCliPath === undefined) {
+      delete process.env.CLAUDE_CLI_PATH;
+    } else {
+      process.env.CLAUDE_CLI_PATH = previousCliPath;
+    }
+    await rm(cliDirectory, { recursive: true, force: true });
   }
 });
 

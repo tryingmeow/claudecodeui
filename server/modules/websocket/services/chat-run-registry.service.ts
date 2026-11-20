@@ -124,6 +124,7 @@ function decorateAndRecordEvent(run: ChatRun, message: NormalizedMessage): Norma
     run.status = 'completed';
     run.completedAt = Date.now();
     evictRunLater(run);
+    notifyRunSettled(run.appSessionId);
   }
 
   run.events.push(outbound);
@@ -132,6 +133,40 @@ function decorateAndRecordEvent(run: ChatRun, message: NormalizedMessage): Norma
   }
 
   return outbound;
+}
+
+/**
+ * Fired when a run reaches its terminal `complete` and the session goes idle.
+ *
+ * The queued-message dispatcher subscribes so a message the user queued during
+ * a turn is sent as soon as that turn ends, instead of waiting for the next
+ * poll. Listeners run on a microtask so a throwing subscriber cannot break the
+ * event that settled the run.
+ */
+const settledListeners = new Set<(appSessionId: string) => void>();
+
+export function onRunSettled(listener: (appSessionId: string) => void): () => void {
+  settledListeners.add(listener);
+  return () => {
+    settledListeners.delete(listener);
+  };
+}
+
+function notifyRunSettled(appSessionId: string): void {
+  for (const listener of settledListeners) {
+    queueMicrotask(() => {
+      // Unsubscribed between the settle and this microtask: stay quiet.
+      if (!settledListeners.has(listener)) {
+        return;
+      }
+      try {
+        listener(appSessionId);
+      } catch (error: unknown) {
+        const message = error instanceof Error ? error.message : String(error);
+        console.error('[ChatRunRegistry] run-settled listener failed', { error: message });
+      }
+    });
+  }
 }
 
 /**
@@ -231,28 +266,6 @@ export const chatRunRegistry = {
 
     runs.set(input.appSessionId, run);
     return run;
-  },
-
-  /**
-   * Marks a completed run as running again, for a turn steered into the same
-   * provider process after it reported `complete` (held open for background
-   * work). The run keeps its writer, event log and `seq` — the process is the
-   * same one — so the new turn's own `complete` passes the exactly-one check
-   * and closes it again. `connection` joins the live audience. Returns false
-   * when there is no completed run to reopen.
-   */
-  reopenRun(appSessionId: string, connection: RealtimeClientConnection | null): boolean {
-    const run = runs.get(appSessionId);
-    if (!run || run.status !== 'completed') {
-      return false;
-    }
-
-    run.status = 'running';
-    run.completedAt = null;
-    if (connection) {
-      run.writer.updateWebSocket(connection);
-    }
-    return true;
   },
 
   getRun(appSessionId: string): ChatRun | undefined {

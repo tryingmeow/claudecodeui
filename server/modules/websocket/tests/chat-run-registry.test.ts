@@ -311,36 +311,3 @@ test('startRun rejects a second concurrent run for the same session', async () =
     assert.ok(third);
   });
 });
-
-test('a completed run reopens for a steered turn and closes on that turn\'s complete', async () => {
-  await withIsolatedDatabase(() => {
-    sessionsDb.createAppSession('app-run-steer', 'claude', '/workspace/demo');
-    const first = new FakeConnection();
-    const run = chatRunRegistry.startRun({
-      appSessionId: 'app-run-steer',
-      provider: 'claude',
-      providerSessionId: null,
-      connection: first,
-      userId: null,
-    });
-    assert.ok(run);
-
-    run.writer.sendComplete({ exitCode: 0 });
-    assert.equal(chatRunRegistry.isProcessing('app-run-steer'), false);
-
-    const second = new FakeConnection();
-    assert.equal(chatRunRegistry.reopenRun('app-run-steer', second as never), true);
-    assert.equal(chatRunRegistry.isProcessing('app-run-steer'), true);
-    assert.equal(chatRunRegistry.reopenRun('app-run-steer', null), false, 'a running run is not reopened');
-
-    run.writer.send({ kind: 'text', provider: 'claude', sessionId: 'native', content: 'answer' });
-    run.writer.sendComplete({ exitCode: 0 });
-
-    // The same writer and sequence carry on, and the new turn's complete is
-    // not dropped as a duplicate.
-    const secondCompletes = second.frames.filter((frame) => frame.kind === 'complete');
-    assert.equal(secondCompletes.length, 1);
-    assert.equal(chatRunRegistry.isProcessing('app-run-steer'), false);
-    assert.ok(Number(second.frames.at(-1)?.seq) > 2);
-  });
-});

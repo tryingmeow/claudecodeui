@@ -1,8 +1,9 @@
 import assert from 'node:assert/strict';
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
+import { chmod, mkdir, mkdtemp, readdir, readlink, realpath, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import test from 'node:test';
+import test, { mock } from 'node:test';
 
 import Database from 'better-sqlite3';
 
@@ -10,7 +11,6 @@ import { closeConnection, initializeDatabase } from '@/modules/database/index.js
 import {
   OpenCodeProviderModels,
   OPENCODE_PREDEFINED_MODELS,
-  parseOpenCodeModelsOutput,
 } from '@/modules/providers/list/opencode/opencode-models.provider.js';
 
 const OPENCODE_ENV_KEYS = [
@@ -19,6 +19,9 @@ const OPENCODE_ENV_KEYS = [
   'OPENAI_API_KEY',
   'OPENCODE_CONFIG',
   'OPENCODE_CONFIG_CONTENT',
+  'OPENCODE_CONFIG_DIR',
+  'XDG_CONFIG_HOME',
+  'XDG_DATA_HOME',
 ];
 
 /**
@@ -142,7 +145,7 @@ test('OpenCode discovers only models available through connected providers', asy
       assert.ok(catalog.OPTIONS.some((option) => option.value === catalog.DEFAULT));
       assert.equal((await adapter.getCurrentActiveModel()).model, catalog.DEFAULT);
     },
-    async () => ['anthropic/claude-sonnet-5'],
+    async () => ['anthropic/claude-sonnet-5', 'opencode/gpt-5.6-terra'],
   );
 
   // A Go subscriber's auth store holds only `opencode-go`, so the whole catalog
@@ -229,6 +232,7 @@ test('OpenCode uses discovered GitHub Copilot models and never falls back to for
     },
     async () => [
       'github-copilot/gpt-5.6-terra',
+      'opencode/gpt-5.6-terra',
       'github-copilot/claude-sonnet-5.5',
     ],
   );
@@ -278,8 +282,8 @@ test('OpenCode keeps curated metadata for discovered models it already knows', a
   );
 });
 
-test('OpenCode counts providers from OPENCODE_CONFIG and OPENCODE_CONFIG_CONTENT', async () => {
-  const listing = async () => ['my-proxy/foo', 'anthropic/claude-sonnet-5'];
+test('OpenCode counts providers from OPENCODE_CONFIG, OPENCODE_CONFIG_CONTENT and a moved config dir', async () => {
+  const listing = async () => ['my-proxy/foo', 'anthropic/claude-sonnet-5', 'opencode/gpt-5.6-terra'];
   const expectProxyAndAnthropic = async (adapter: OpenCodeProviderModels): Promise<void> => {
     const catalog = await adapter.getSupportedModels();
     assert.deepEqual(
@@ -306,6 +310,145 @@ test('OpenCode counts providers from OPENCODE_CONFIG and OPENCODE_CONFIG_CONTENT
     },
     expectProxyAndAnthropic,
     listing,
+  );
+
+  for (const envKey of ['XDG_CONFIG_HOME', 'OPENCODE_CONFIG_DIR'] as const) {
+    await withOpenCodeHome(
+      async (homeDir) => {
+        await writeOpenCodeAuth(homeDir, { anthropic: { type: 'api', key: 'test' } });
+        const baseDir = path.join(homeDir, 'moved-config');
+        const configDir = envKey === 'XDG_CONFIG_HOME' ? path.join(baseDir, 'opencode') : baseDir;
+        await mkdir(configDir, { recursive: true });
+        await writeFile(path.join(configDir, 'opencode.json'), JSON.stringify({ provider: { 'my-proxy': {} } }), 'utf8');
+        process.env[envKey] = baseDir;
+      },
+      expectProxyAndAnthropic,
+      listing,
+    );
+  }
+
+  // The usual XDG setup moves both: the login in auth.json still counts next to the moved config.
+  await withOpenCodeHome(
+    async (homeDir) => {
+      const dataDir = path.join(homeDir, 'xdg-data', 'opencode');
+      await mkdir(dataDir, { recursive: true });
+      await writeFile(path.join(dataDir, 'auth.json'), JSON.stringify({ anthropic: { type: 'api', key: 'test' } }), 'utf8');
+      const configDir = path.join(homeDir, 'xdg-config', 'opencode');
+      await mkdir(configDir, { recursive: true });
+      await writeFile(path.join(configDir, 'opencode.json'), JSON.stringify({ provider: { 'my-proxy': {} } }), 'utf8');
+      process.env.XDG_DATA_HOME = path.join(homeDir, 'xdg-data');
+      process.env.XDG_CONFIG_HOME = path.join(homeDir, 'xdg-config');
+    },
+    expectProxyAndAnthropic,
+    listing,
+  );
+});
+
+// The config from issue #1771: OpenCode v2's `providers` / `settings.apiKey` shape.
+const REPORTER_V2_CONFIG = {
+  providers: {
+    res: {
+      settings: { apiKey: '{file:~/.config/opencode/res.key}' },
+      models: { 'gemini-4-argon': {} },
+    },
+  },
+};
+
+const REPORTER_V2_JSONC = `{
+  // OpenCode v2 shape, with comments and trailing commas
+  "providers": {
+    "res": {
+      "settings": { "apiKey": "{file:~/.config/opencode/res.key}", },
+      /* models the proxy serves */
+      "models": { "gemini-4-argon": {}, },
+    },
+  },
+}`;
+
+const writeOpenCodeConfigFile = async (homeDir: string, fileName: string, content: string) => {
+  const configDir = path.join(homeDir, '.config', 'opencode');
+  await mkdir(configDir, { recursive: true });
+  await writeFile(path.join(configDir, fileName), content, 'utf8');
+};
+
+const listedModels = async (adapter: OpenCodeProviderModels): Promise<string[]> =>
+  (await adapter.getSupportedModels()).OPTIONS.map((option) => option.value);
+
+for (const [label, fileName, content] of [
+  ['opencode.json', 'opencode.json', JSON.stringify(REPORTER_V2_CONFIG)],
+  ['commented opencode.jsonc', 'opencode.jsonc', REPORTER_V2_JSONC],
+] as const) {
+  test(`OpenCode counts v2 \`providers\` from ${label} alongside another connected provider`, async () => {
+    await withOpenCodeHome(
+      async (homeDir) => {
+        await writeOpenCodeAuth(homeDir, { other: { type: 'api', key: 'test' } });
+        await writeOpenCodeConfigFile(homeDir, fileName, content);
+      },
+      async (adapter) => {
+        assert.deepEqual(await listedModels(adapter), ['res/gemini-4-argon', 'other/x']);
+      },
+      async () => ['res/gemini-4-argon', 'other/x'],
+    );
+
+    await withOpenCodeHome(
+      async (homeDir) => {
+        await writeOpenCodeAuth(homeDir, { anthropic: { type: 'api', key: 'test' } });
+        await writeOpenCodeConfigFile(homeDir, fileName, content);
+      },
+      async (adapter) => {
+        assert.deepEqual(
+          await listedModels(adapter),
+          ['anthropic/claude-sonnet-5', 'res/gemini-4-argon'],
+        );
+      },
+      async () => ['anthropic/claude-sonnet-5', 'res/gemini-4-argon', 'opencode/gpt-5.6-terra'],
+    );
+  });
+}
+
+test('OpenCode lists a keyless v2 `providers` entry next to another connected provider', async () => {
+  await withOpenCodeHome(
+    async (homeDir) => {
+      await writeOpenCodeAuth(homeDir, { other: { type: 'api', key: 'test' } });
+      await writeOpenCodeConfigFile(
+        homeDir,
+        'opencode.jsonc',
+        '{ "providers": { "res": { "models": { "gemini-4-argon": {} } }, }, // keyless\n}',
+      );
+    },
+    async (adapter) => {
+      assert.deepEqual(await listedModels(adapter), ['res/gemini-4-argon', 'other/x']);
+    },
+    async () => ['res/gemini-4-argon', 'other/x', 'opencode/gpt-5.6-terra'],
+  );
+});
+
+test('OpenCode does not filter the listing on a v2 `providers` entry alone', async () => {
+  // A v2 login lives in OpenCode's database, which is not read, so openai here
+  // may well be connected; the listing stays unfiltered, as it was before.
+  await withOpenCodeHome(
+    (homeDir) => writeOpenCodeConfigFile(homeDir, 'opencode.json', JSON.stringify(REPORTER_V2_CONFIG)),
+    async (adapter) => {
+      assert.deepEqual(await listedModels(adapter), ['openai/gpt-5.6', 'res/gemini-4-argon']);
+    },
+    async () => ['openai/gpt-5.6', 'res/gemini-4-argon'],
+  );
+});
+
+test('OpenCode keeps listing v1 `provider` entries as before', async () => {
+  await withOpenCodeHome(
+    async (homeDir) => {
+      await writeOpenCodeAuth(homeDir, { other: { type: 'api', key: 'test' } });
+      await writeOpenCodeConfigFile(
+        homeDir,
+        'opencode.json',
+        JSON.stringify({ provider: { res: { options: { apiKey: 'test' } } } }),
+      );
+    },
+    async (adapter) => {
+      assert.deepEqual(await listedModels(adapter), ['res/gemini-4-argon', 'other/x']);
+    },
+    async () => ['res/gemini-4-argon', 'other/x', 'opencode/gpt-5.6-terra'],
   );
 });
 
@@ -388,6 +531,287 @@ test('OpenCode retries a failed CLI listing sooner than a successful one', async
       assert.deepEqual(recovered.OPTIONS.map((option) => option.value), ['anthropic/claude-sonnet-5']);
     },
   );
+});
+
+test('OpenCode keeps serving the last good listing when a refresh fails', async () => {
+  await withOpenCodeHome(
+    (homeDir) => writeOpenCodeAuth(homeDir, { anthropic: { type: 'api', key: 'test' } }),
+    async () => {
+      let now = 0;
+      let readCount = 0;
+      const adapter = new OpenCodeProviderModels(
+        async () => {
+          readCount += 1;
+          // The first refresh times out, as any listing can on a busy host.
+          if (readCount === 2) {
+            return [];
+          }
+          return readCount === 1 ? ['anthropic/claude-sonnet-5'] : ['anthropic/claude-opus-5'];
+        },
+        () => now,
+      );
+      const listedValues = async (): Promise<string[]> =>
+        (await adapter.getSupportedModels()).OPTIONS.map((option) => option.value);
+
+      assert.deepEqual(await listedValues(), ['anthropic/claude-sonnet-5']);
+
+      // The failed refresh must not put the static catalog back in the picker...
+      now = 5 * 60_000;
+      await adapter.getSupportedModels();
+      await new Promise((resolve) => setImmediate(resolve));
+      assert.equal(readCount, 2);
+      assert.deepEqual(await listedValues(), ['anthropic/claude-sonnet-5']);
+      // Reading the catalog again before the retry is due starts no listing.
+      assert.equal(readCount, 2);
+
+      // ...and is retried on the short schedule.
+      now += 30_000;
+      await adapter.getSupportedModels();
+      await new Promise((resolve) => setImmediate(resolve));
+      assert.equal(readCount, 3);
+      assert.deepEqual(await listedValues(), ['anthropic/claude-opus-5']);
+    },
+  );
+});
+
+const findEnvKey = (name: string) =>
+  Object.keys(process.env).find((key) => key.toLowerCase() === name.toLowerCase()) || name;
+
+/**
+ * A stand-in for the real CLI, configured by the `fake.json` next to it:
+ * `opencode models` prints `listing.txt` in one write and exits with
+ * `exitCode` (default 0). `gated` makes it drop a `started` marker first and
+ * wait for a `release` file, so a test can move a mocked clock while the
+ * listing "runs"; it records a SIGTERM in `killed`, and with `partial` it
+ * prints one model line before it waits, as a CLI killed at the budget may
+ * already have. `cutUnlessFile` makes it print only the first 100 lines
+ * unless its stdout is a regular file, which is what real OpenCode does into
+ * a pipe that CloudCLI is too busy to read: it exited 0 after 85 of 373 lines
+ * with the reader held up while it wrote, and after 75-306 of 358 on a
+ * one-core host.
+ */
+const FAKE_OPENCODE_SCRIPT = `
+const fs = require('node:fs');
+const path = require('node:path');
+const file = (name) => path.join(__dirname, name);
+const config = JSON.parse(fs.readFileSync(file('fake.json'), 'utf8'));
+const print = () => {
+  let listing = fs.readFileSync(file('listing.txt'), 'utf8');
+  if (config.cutUnlessFile && !fs.fstatSync(1).isFile()) {
+    listing = listing.split('\\n').slice(0, 100).join('\\n');
+  }
+  fs.writeSync(1, listing);
+  process.exit(config.exitCode ?? 0);
+};
+if (!config.gated) {
+  print();
+} else {
+  process.on('SIGTERM', () => {
+    fs.writeFileSync(file('killed'), '');
+    process.exit(143);
+  });
+  if (config.partial) {
+    fs.writeSync(1, 'openrouter/partial/model\\n');
+  }
+  fs.writeFileSync(file('started'), '');
+  // Never outlive a broken test run (its cleanup deletes this directory).
+  const giveUpAt = Date.now() + 30000;
+  const poll = () => {
+    if (!fs.existsSync(__dirname) || Date.now() > giveUpAt) {
+      process.exit(1);
+    }
+    if (fs.existsSync(file('release'))) {
+      print();
+      return;
+    }
+    setTimeout(poll, 20);
+  };
+  poll();
+}
+`;
+
+type FakeOpenCodeCliConfig = {
+  gated?: boolean;
+  partial?: boolean;
+  cutUnlessFile?: boolean;
+  exitCode?: number;
+  /** Puts no `opencode` on PATH at all. */
+  missing?: boolean;
+};
+
+type FakeOpenCodeCli = {
+  /** Lets a gated `opencode models` print its listing and exit. */
+  release: () => Promise<void>;
+  waitForStart: () => Promise<void>;
+  waitForKill: () => Promise<void>;
+  /** Whatever the adapter left in the temp dir it was given, or (on Linux) still holds open there. */
+  leftoverTempEntries: () => Promise<string[]>;
+};
+
+// The files under `dir` this process still has open, deleted ones included. Linux only; on Windows
+// an open file keeps the adapter's cleanup from deleting it, so the entries show it there.
+const openFilesUnder = async (dir: string): Promise<string[]> => {
+  if (process.platform !== 'linux') {
+    return [];
+  }
+  const prefix = `${await realpath(dir)}${path.sep}`;
+  const targets = await Promise.all((await readdir('/proc/self/fd')).map(
+    (fd) => readlink(path.join('/proc/self/fd', fd)).catch(() => ''),
+  ));
+  return targets.filter((target) => target.startsWith(prefix));
+};
+
+// Waits in real time (the budget tests mock only setTimeout, not setImmediate
+// or Date) and fails instead of hanging when the fake never gets there.
+const waitForFile = async (filePath: string, description: string): Promise<void> => {
+  const giveUpAt = Date.now() + 15_000;
+  while (!existsSync(filePath)) {
+    if (Date.now() > giveUpAt) {
+      assert.fail(`timed out waiting for ${description}`);
+    }
+    await new Promise<void>((resolve) => setImmediate(resolve));
+  }
+};
+
+/**
+ * Runs `run` with the fake `opencode` first on PATH, and with os.tmpdir()
+ * pointing at a fresh directory, so a test sees any temp file the adapter
+ * leaves behind. The default reader runs the `opencode` it finds on PATH,
+ * like production.
+ */
+const withFakeOpenCodeCli = async (
+  listing: string,
+  config: FakeOpenCodeCliConfig,
+  run: (fake: FakeOpenCodeCli) => Promise<void>,
+): Promise<void> => {
+  const binDir = await mkdtemp(path.join(os.tmpdir(), 'opencode-fake-cli-'));
+  const tempDir = path.join(binDir, 'tmp');
+  const pathKey = findEnvKey('PATH');
+  const pathExtKey = findEnvKey('PATHEXT');
+  // os.tmpdir() reads TMPDIR on POSIX and TEMP/TMP on Windows, on every call.
+  const tempKeys = ['TMPDIR', 'TMP', 'TEMP'].map(findEnvKey);
+  const originalEnv = [pathKey, pathExtKey, ...tempKeys].map((key) => [key, process.env[key]] as const);
+  const originalPath = process.env[pathKey];
+  const originalPathExt = process.env[pathExtKey];
+  const fake: FakeOpenCodeCli = {
+    release: () => writeFile(path.join(binDir, 'release'), ''),
+    waitForStart: () => waitForFile(path.join(binDir, 'started'), 'the fake `opencode models` to start'),
+    waitForKill: () => waitForFile(path.join(binDir, 'killed'), 'the fake `opencode models` to get SIGTERM'),
+    leftoverTempEntries: async () => [...await readdir(tempDir), ...await openFilesUnder(tempDir)],
+  };
+
+  try {
+    await mkdir(tempDir);
+    if (!config.missing) {
+      const script = path.join(binDir, 'opencode.cjs');
+      await writeFile(script, FAKE_OPENCODE_SCRIPT);
+      await writeFile(path.join(binDir, 'fake.json'), JSON.stringify(config));
+      await writeFile(path.join(binDir, 'listing.txt'), listing);
+      if (process.platform === 'win32') {
+        await writeFile(path.join(binDir, 'opencode.cmd'), `@echo off\r\n"${process.execPath}" "${script}" %*\r\n`);
+        if (!originalPathExt?.toUpperCase().includes('.CMD')) {
+          process.env[pathExtKey] = `.COM;.EXE;.BAT;.CMD${originalPathExt ? `;${originalPathExt}` : ''}`;
+        }
+      } else {
+        // exec so the adapter's kill() on timeout reaches the node process itself.
+        const wrapper = path.join(binDir, 'opencode');
+        await writeFile(wrapper, `#!/bin/sh\nexec "${process.execPath}" "${script}" "$@"\n`);
+        await chmod(wrapper, 0o755);
+      }
+    }
+    process.env[pathKey] = config.missing ? binDir : `${binDir}${path.delimiter}${originalPath ?? ''}`;
+    for (const key of tempKeys) {
+      process.env[key] = tempDir;
+    }
+
+    await run(fake);
+  } finally {
+    // Lets a gated fake that is still polling exit right away.
+    await fake.release().catch(() => {});
+    for (const [key, value] of originalEnv) {
+      if (value === undefined) {
+        delete process.env[key];
+      } else {
+        process.env[key] = value;
+      }
+    }
+    // On Windows a fake that outlived its kill can hold a file here a moment longer.
+    await rm(binDir, { recursive: true, force: true, maxRetries: 10 });
+  }
+};
+
+test('OpenCode waits for an `opencode models` listing that takes longer than 5 s', async () => {
+  const listing = ['openrouter/qwen/qwen3-coder-flash', 'openrouter/google/gemini-3-pro-image-preview'];
+  await withOpenCodeHome(async () => {}, () => withFakeOpenCodeCli(listing.join('\n'), { gated: true }, async (fake) => {
+    // The adapter arms its timeout as soon as it spawns the CLI, so it must see the mocked setTimeout.
+    mock.timers.enable({ apis: ['setTimeout'] });
+    try {
+      const pending = new OpenCodeProviderModels().getSupportedModels();
+      // Move the clock only once the CLI runs, i.e. once the timeout is armed.
+      await fake.waitForStart();
+
+      // On one core that another process also used, listing took from about 10 s to over 30 s. A
+      // 5 s budget fell back to the static catalog there, which has none of the OpenRouter models of
+      // a user whose key CloudCLI cannot see (#1695).
+      mock.timers.tick(29_999);
+      await fake.release();
+
+      const models = await pending;
+      assert.deepEqual(models.OPTIONS.map((option) => option.value), listing);
+      assert.equal(models.DEFAULT, listing[0]);
+    } finally {
+      mock.timers.reset();
+    }
+  }));
+});
+
+test('OpenCode still gives up on, and kills, an `opencode models` that never answers', async () => {
+  const listing = 'openrouter/qwen/qwen3-coder-flash\n';
+  await withOpenCodeHome(async () => {}, () => withFakeOpenCodeCli(listing, { gated: true, partial: true }, async (fake) => {
+    mock.timers.enable({ apis: ['setTimeout'] });
+    try {
+      const pending = new OpenCodeProviderModels().getSupportedModels();
+      await fake.waitForStart();
+
+      mock.timers.tick(30_000);
+
+      // The line the CLI printed before it was killed is not taken for a listing: no provider is
+      // readable in this home, so the whole static catalog stands in.
+      assert.deepEqual(await pending, OPENCODE_PREDEFINED_MODELS);
+      // On Windows kill() ends the .cmd shim's cmd.exe, which does not signal the node behind it,
+      // and that node still holds the listing file.
+      if (process.platform !== 'win32') {
+        await fake.waitForKill();
+        assert.deepEqual(await fake.leftoverTempEntries(), []);
+      }
+    } finally {
+      mock.timers.reset();
+    }
+  }));
+});
+
+test('OpenCode reads the whole listing of a CLI that exits as soon as it has written it', async () => {
+  const listing = Array.from({ length: 5_000 }, (_, index) => `openrouter/vendor/model-${index}`);
+  // A line that is not a model reference, and no newline after the last one.
+  const output = ['Listing models', ...listing].join('\n');
+  await withOpenCodeHome(async () => {}, () => withFakeOpenCodeCli(output, { cutUnlessFile: true }, async (fake) => {
+    const values = (await new OpenCodeProviderModels().getSupportedModels()).OPTIONS.map((option) => option.value);
+
+    assert.equal(values.length, listing.length);
+    assert.deepEqual(values, listing);
+    assert.deepEqual(await fake.leftoverTempEntries(), []);
+  }));
+});
+
+test('OpenCode ignores the output of an `opencode models` that fails, and copes with none on PATH', async () => {
+  const listing = 'openrouter/qwen/qwen3-coder-flash\n';
+  for (const config of [{ exitCode: 1 }, { missing: true }]) {
+    await withOpenCodeHome(async () => {}, () => withFakeOpenCodeCli(listing, config, async (fake) => {
+      // A failed run may have printed only part of its listing.
+      assert.deepEqual(await new OpenCodeProviderModels().getSupportedModels(), OPENCODE_PREDEFINED_MODELS);
+      assert.deepEqual(await fake.leftoverTempEntries(), []);
+    }));
+  }
 });
 
 const writeOpenCodeSessionDatabase = async (homeDir: string, rows: Array<Record<string, unknown>>) => {
@@ -496,97 +920,4 @@ test('OpenCode composes the provider prefix into session model ids', async () =>
     }
     await rm(tempSessionsDirectory, { recursive: true, force: true });
   }
-});
-
-test('OpenCode prefers the live CLI catalog and keeps the curated default only when it is live', async () => {
-  const live = new OpenCodeProviderModels(async () => [
-    { value: 'anthropic/claude-opus-5', label: 'Claude Opus 5' },
-    { value: 'opencode/gpt-5.6-terra', label: 'GPT-5.6 Terra' },
-  ]);
-  const catalog = await live.getSupportedModels();
-  assert.deepEqual(catalog.OPTIONS.map((option) => option.value), ['anthropic/claude-opus-5', 'opencode/gpt-5.6-terra']);
-  assert.equal(catalog.DEFAULT, OPENCODE_PREDEFINED_MODELS.DEFAULT);
-
-  const withoutDefault = new OpenCodeProviderModels(async () => [
-    { value: 'openrouter/some-model', label: 'Some model' },
-  ]);
-  assert.equal((await withoutDefault.getSupportedModels()).DEFAULT, 'openrouter/some-model');
-});
-
-test('OpenCode verbose model output parses into options and skips deprecated models', () => {
-  const stdout = [
-    'opencode/gpt-5.6-terra',
-    '{',
-    '  "name": "GPT-5.6 Terra",',
-    '  "cost": { "input": 0, "output": 0 }',
-    '}',
-    'anthropic/claude-old',
-    '{',
-    '  "name": "Old",',
-    '  "status": "deprecated"',
-    '}',
-    'openrouter/plain-model',
-  ].join('\n');
-
-  assert.deepEqual(parseOpenCodeModelsOutput(stdout), [
-    { value: 'opencode/gpt-5.6-terra', label: 'GPT-5.6 Terra', description: 'OpenCode Zen · Free' },
-    { value: 'openrouter/plain-model', label: 'plain-model', description: 'openrouter' },
-  ]);
-});
-
-test('OpenCode trusts project models and preserves live metadata alongside curated effort', async () => {
-  await withOpenCodeHome(
-    (homeDir) => writeOpenCodeAuth(homeDir, { anthropic: { type: 'api', key: 'test' } }),
-    async () => {
-      const adapter = new OpenCodeProviderModels(async () => [
-        { value: 'project-only/new-model', label: 'Project Model', description: 'Project · Free' },
-        { value: 'opencode-go/glm-5.3-flash', label: 'Live GLM', description: 'Go · Free' },
-      ]);
-      const catalog = await adapter.getSupportedModels();
-      assert.equal(catalog.DEFAULT, 'project-only/new-model');
-      assert.deepEqual(catalog.OPTIONS.map((option) => option.label), ['Project Model', 'Live GLM']);
-      assert.equal(catalog.OPTIONS[1].description, 'Go · Free');
-      assert.deepEqual(catalog.OPTIONS[1].effort?.values.map((entry) => entry.value), ['low', 'high', 'max']);
-    },
-  );
-});
-
-test('OpenCode custom config sources constrain static fallback when discovery fails', async () => {
-  for (const inline of [true, false]) {
-    await withOpenCodeHome(async (homeDir) => {
-      const config = JSON.stringify({ provider: { 'opencode-go': {} } });
-      if (inline) process.env.OPENCODE_CONFIG_CONTENT = config;
-      else {
-        const configPath = path.join(homeDir, 'custom.json');
-        await writeFile(configPath, config);
-        process.env.OPENCODE_CONFIG = configPath;
-      }
-    }, async (adapter) => {
-      const catalog = await adapter.getSupportedModels();
-      assert.ok(catalog.OPTIONS.length > 0);
-      assert.ok(catalog.OPTIONS.every((option) => option.value.startsWith('opencode-go/')));
-      assert.ok(catalog.OPTIONS.some((option) => option.value === catalog.DEFAULT));
-    });
-  }
-});
-
-
-test('a failed OpenCode refresh retains successful live models and retries soon', async () => {
-  let now = 0;
-  let reads = 0;
-  const adapter = new OpenCodeProviderModels(async () => {
-    reads += 1;
-    if (reads === 2) throw new Error('temporary CLI failure');
-    return [{ value: 'project-only/model', label: 'Live Model' }];
-  }, () => now);
-  const original = await adapter.getSupportedModels();
-  now = 300_000;
-  assert.deepEqual(await adapter.getSupportedModels(), original);
-  await new Promise((resolve) => setImmediate(resolve));
-  assert.deepEqual(await adapter.getSupportedModels(), original);
-  assert.equal(reads, 2);
-  now += 30_000;
-  assert.deepEqual(await adapter.getSupportedModels(), original);
-  await new Promise((resolve) => setImmediate(resolve));
-  assert.equal(reads, 3);
 });
